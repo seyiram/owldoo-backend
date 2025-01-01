@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import connectDB from './config/database';
+import router from './routes';
 // import taskRoutes from './routes/taskRoutes';
 
 const app = express();
@@ -11,7 +12,7 @@ app.use(cors());
 app.use(express.json());
 
 // Routes
-// app.use('/api/tasks', taskRoutes);
+app.use('/api', router);
 
 // Database connection
 connectDB();

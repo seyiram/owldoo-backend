@@ -6,3 +6,4 @@ export { default as EventAnalytics } from './EventAnalytics';
 export { default as NLPLog } from './NLPLog';
 export { default as SmartSuggestions } from './SmartSuggestions';
 export { default as UserPreferences } from './UserPreferences';
+export { default as Thread } from './Thread';

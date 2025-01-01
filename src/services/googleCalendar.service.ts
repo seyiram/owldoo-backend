@@ -2,6 +2,8 @@
 import { google, calendar_v3 } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
 import { ParsedCommand, CalendarEvent } from '../types/calendar.types';
+import fs from 'fs';
+import path from 'path';
 
 class GoogleCalendarService {
     private oauth2Client: OAuth2Client;
@@ -9,11 +11,25 @@ class GoogleCalendarService {
     private timeZone: string;
 
     constructor() {
-        this.oauth2Client = new google.auth.OAuth2(
-            process.env.GOOGLE_CLIENT_ID,
-            process.env.GOOGLE_CLIENT_SECRET,
-            process.env.GOOGLE_REDIRECT_URI
-        );
+        // this.oauth2Client = new google.auth.OAuth2(
+        //     process.env.GOOGLE_CLIENT_ID,
+        //     process.env.GOOGLE_CLIENT_SECRET,
+        //     process.env.GOOGLE_REDIRECT_URI
+        // );
+
+        const credentialsPath = path.join(__dirname, '../config/client_secret_743979723001-ba6houcjh052sqjk8e2mumb7jffkdc3f.apps.googleusercontent.com.json');
+        const tokenPath = path.join(__dirname, '../../token.json');
+
+        const credentials = JSON.parse(fs.readFileSync(credentialsPath, 'utf-8'));
+        const token = JSON.parse(fs.readFileSync(tokenPath, 'utf-8'));
+
+        const { client_secret, client_id, redirect_uris } = credentials.web;
+        this.oauth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
+
+        //set the credentials
+        this.oauth2Client.setCredentials(token);
+
+
         this.calendar = google.calendar({ version: 'v3', auth: this.oauth2Client });
         this.timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     }
@@ -41,6 +57,8 @@ class GoogleCalendarService {
         return tokens;
     }
 
+
+
     async createEvent(parsedCommand: ParsedCommand): Promise<CalendarEvent> {
         const endTime = new Date(parsedCommand.startTime);
         endTime.setMinutes(endTime.getMinutes() + parsedCommand.duration);
@@ -59,7 +77,7 @@ class GoogleCalendarService {
             location: parsedCommand.location,
             attendees: parsedCommand.attendees?.map(attendee => ({ email: attendee })),
             reminders: {
-                useDefault: true,
+                useDefault: false,
                 overrides: [
                     { method: 'email', minutes: 24 * 60 },
                     { method: 'popup', minutes: 30 }

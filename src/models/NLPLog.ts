@@ -1,6 +1,8 @@
 // src/models/NLPLog.ts
 import mongoose, { Schema, Document } from 'mongoose';
 
+
+
 export interface INLPLog extends Document {
     userId: string;
     originalText: string;

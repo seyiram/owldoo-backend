@@ -48,7 +48,7 @@ class NLPService {
     Required fields in JSON response:
     - title: Clear, concise event title
     - startTime: ISO datetime string
-    - duration: Length in minutes
+    - duration: Length in minutes 
     - description: Brief event description
     - isRecurring: boolean
     

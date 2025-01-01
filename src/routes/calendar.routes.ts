@@ -5,17 +5,18 @@ import { authenticateUser as authMiddleware } from '../middleware/auth.middlewar
 const router = express.Router();
 
 // Natural language routes
-router.post('/events/create-from-text', authMiddleware, calendarController.createEventFromText);
+router.post('/events/create-from-text', calendarController.createEventFromText);
 
 // Standard CRUD routes
-router.post('/events', authMiddleware, calendarController.createEvent);
-router.get('/events', authMiddleware, calendarController.getEvents);
-router.get('/events/:id', authMiddleware, calendarController.getEvent);
-router.put('/events/:id', authMiddleware, calendarController.updateEvent);
-router.delete('/events/:id', authMiddleware, calendarController.deleteEvent);
+router.post('/events', calendarController.createEvent);
+router.get('/events', calendarController.getEvents);
+router.get('/events/:id', calendarController.getEvent);
+router.put('/events/:id', calendarController.updateEvent);
+
+router.delete('/events/:id', calendarController.deleteEvent);
 
 // Calendar availability
-router.get('/availability', authMiddleware, calendarController.checkAvailability);
-router.get('/suggest-time', authMiddleware, calendarController.suggestAlternativeTime);
+router.get('/availability', calendarController.checkAvailability);
+router.get('/suggest-time', calendarController.suggestAlternativeTime);
 
 export default router;
