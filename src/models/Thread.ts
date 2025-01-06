@@ -3,7 +3,7 @@ import { Message } from '../types/chat.types';
 export interface IThread extends Document {
   messages: Message[];
   createdAt: Date;
-  userId?: string;
+  userId?: Schema.Types.ObjectId;
 }
 
 const messageSchema = new Schema<Message>({
