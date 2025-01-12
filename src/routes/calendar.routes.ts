@@ -1,8 +1,13 @@
 import express from 'express';
-import * as calendarController from '../controllers/calendar.controller';
+import calendarController from '../controllers/calendar.controller';
 import { authenticateUser as authMiddleware } from '../middleware/auth.middleware';
 
 const router = express.Router();
+
+// Auth routes
+router.get('/auth/url', calendarController.getAuthUrl);
+router.get('/auth/callback', calendarController.handleAuthCallback);
+router.get('/auth/status', calendarController.checkAuthStatus);
 
 // Natural language routes
 router.post('/events/create-from-text', calendarController.createEventFromText);

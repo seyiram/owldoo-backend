@@ -1,4 +1,3 @@
-
 import { google, calendar_v3 } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
 import { ParsedCommand, CalendarEvent } from '../types/calendar.types';
@@ -6,76 +5,145 @@ import fs from 'fs';
 import path from 'path';
 
 class GoogleCalendarService {
-    private oauth2Client: OAuth2Client;
-    private calendar: calendar_v3.Calendar;
-    private timeZone: string;
+    private oauth2Client!: OAuth2Client;
+    private calendar!: calendar_v3.Calendar;
+    private timeZone!: string;
+    private isAuthenticated: boolean = false;
+
+    private readonly BUSINESS_HOURS = {
+        start: 9,
+        end: 17
+    };
+    private readonly tokenPath: string;
+    private readonly credentialsPath: string;
 
     constructor() {
-        // this.oauth2Client = new google.auth.OAuth2(
-        //     process.env.GOOGLE_CLIENT_ID,
-        //     process.env.GOOGLE_CLIENT_SECRET,
-        //     process.env.GOOGLE_REDIRECT_URI
-        // );
-
-        const credentialsPath = path.join(__dirname, '../config/client_secret_743979723001-ba6houcjh052sqjk8e2mumb7jffkdc3f.apps.googleusercontent.com.json');
-        const tokenPath = path.join(__dirname, '../../token.json');
-
-        const credentials = JSON.parse(fs.readFileSync(credentialsPath, 'utf-8'));
-        const token = JSON.parse(fs.readFileSync(tokenPath, 'utf-8'));
-
-        const { client_secret, client_id, redirect_uris } = credentials.web;
-        this.oauth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
-
-        //set the credentials
-        this.oauth2Client.setCredentials(token);
-
-
-        this.calendar = google.calendar({ version: 'v3', auth: this.oauth2Client });
-        this.timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        this.credentialsPath = path.join(__dirname, '../config/client_secret_743979723001-ba6houcjh052sqjk8e2mumb7jffkdc3f.apps.googleusercontent.com.json');
+        this.tokenPath = path.join(__dirname, '../../token.json');
+        this.initializeOAuth();
     }
 
-    async setCredentials(credentials: any) {
-        this.oauth2Client.setCredentials(credentials);
+    private initializeOAuth() {
+        try {
+            const credentials = JSON.parse(fs.readFileSync(this.credentialsPath, 'utf-8'));
+            const { client_secret, client_id, redirect_uris } = credentials.web;
+            
+            this.oauth2Client = new google.auth.OAuth2(
+                client_id,
+                client_secret,
+                redirect_uris[0]
+            );
+
+            if (fs.existsSync(this.tokenPath)) {
+                const tokens = JSON.parse(fs.readFileSync(this.tokenPath, 'utf-8'));
+                this.oauth2Client.setCredentials(tokens);
+                this.calendar = google.calendar({ version: 'v3', auth: this.oauth2Client });
+                this.timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                this.isAuthenticated = true;
+            }
+
+            this.oauth2Client.on('tokens', (tokens) => {
+                if (tokens.refresh_token) {
+                    this.saveTokens({
+                        ...JSON.parse(fs.readFileSync(this.tokenPath, 'utf-8')),
+                        ...tokens
+                    });
+                }
+            });
+        } catch (error) {
+            console.error('Error initializing OAuth:', error);
+            this.isAuthenticated = false;
+        }
     }
 
-    async getAuthUrl(): Promise<string> {
-        const scopes = [
-            'https://www.googleapis.com/auth/calendar',
-            'https://www.googleapis.com/auth/calendar.events'
-        ];
-
-        return this.oauth2Client.generateAuthUrl({
-            access_type: 'offline',
-            scope: scopes,
-            prompt: 'consent'
-        });
+    private saveTokens(tokens: any) {
+        try {
+            fs.writeFileSync(this.tokenPath, JSON.stringify(tokens, null, 2));
+            this.isAuthenticated = true;
+        } catch (error) {
+            console.error('Error saving tokens:', error);
+            this.isAuthenticated = false;
+        }
     }
 
-    async handleAuthCallback(code: string) {
-        const { tokens } = await this.oauth2Client.getToken(code);
-        this.oauth2Client.setCredentials(tokens);
-        return tokens;
+    public isUserAuthenticated(): boolean {
+        return this.isAuthenticated;
     }
 
+    private async refreshTokenIfNeeded(): Promise<void> {
+        try {
+            if (!fs.existsSync(this.tokenPath)) {
+                throw new Error('AUTH_REQUIRED');
+            }
+    
+            const tokens = JSON.parse(fs.readFileSync(this.tokenPath, 'utf-8'));
+            
+            // Check if token needs refresh
+            if (!tokens.expiry_date || tokens.expiry_date < Date.now() + 60000) {
+                // Use getAccessToken instead of refreshToken
+                const response = await this.oauth2Client.getAccessToken();
+                const newTokens = response.res?.data;
+                
+                if (newTokens) {
+                    this.saveTokens({
+                        ...tokens,
+                        ...newTokens
+                    });
+                    
+                    this.oauth2Client.setCredentials({
+                        ...tokens,
+                        ...newTokens
+                    });
+                } else {
+                    throw new Error('Failed to refresh token');
+                }
+            }
+        } catch (error) {
+            console.error('Error refreshing token:', error);
+            this.isAuthenticated = false;
+            throw new Error('AUTH_REQUIRED');
+        }
+    }
 
+    private async executeWithAuth<T>(operation: () => Promise<T>): Promise<T> {
+        if (!this.isAuthenticated) {
+            throw new Error('AUTH_REQUIRED');
+        }
 
-    async createEvent(parsedCommand: ParsedCommand): Promise<CalendarEvent> {
-        const endTime = new Date(parsedCommand.startTime);
-        endTime.setMinutes(endTime.getMinutes() + parsedCommand.duration);
+        try {
+            await this.refreshTokenIfNeeded();
+            return await operation();
+        } catch (error: any) {
+            if (error?.message === 'AUTH_REQUIRED' || 
+                error?.response?.data?.error === 'invalid_grant') {
+                this.isAuthenticated = false;
+                throw new Error('AUTH_REQUIRED');
+            }
+            throw error;
+        }
+    }
 
+    private createEventResource(
+        parsedCommand: ParsedCommand,
+        endTime: Date,
+        existingEvent?: calendar_v3.Schema$Event
+    ): calendar_v3.Schema$Event {
+        const baseEvent = existingEvent || {};
+        
         const eventResource: calendar_v3.Schema$Event = {
-            summary: parsedCommand.title,
-            description: parsedCommand.description,
+            ...baseEvent,
+            summary: parsedCommand.title || baseEvent.summary,
+            description: parsedCommand.description || baseEvent.description,
             start: {
-                dateTime: parsedCommand.startTime.toISOString(),
+                dateTime: parsedCommand.startTime?.toISOString() || baseEvent.start?.dateTime,
                 timeZone: this.timeZone,
             },
             end: {
                 dateTime: endTime.toISOString(),
                 timeZone: this.timeZone,
             },
-            location: parsedCommand.location,
-            attendees: parsedCommand.attendees?.map(attendee => ({ email: attendee })),
+            location: parsedCommand.location || baseEvent.location,
+            attendees: parsedCommand.attendees?.map(attendee => ({ email: attendee })) || baseEvent.attendees,
             reminders: {
                 useDefault: false,
                 overrides: [
@@ -83,7 +151,7 @@ class GoogleCalendarService {
                     { method: 'popup', minutes: 30 }
                 ]
             },
-            transparency: 'opaque', // Show as busy
+            transparency: 'opaque',
             visibility: 'default'
         };
 
@@ -100,23 +168,69 @@ class GoogleCalendarService {
             };
         }
 
+        return eventResource;
+    }
+
+    private calculateEndTime(startTime: Date, duration: number): Date {
+        const endTime = new Date(startTime);
+        endTime.setMinutes(endTime.getMinutes() + duration);
+        return endTime;
+    }
+
+    private isBusinessHours(date: Date): boolean {
+        const hour = date.getHours();
+        return hour >= this.BUSINESS_HOURS.start && hour < this.BUSINESS_HOURS.end;
+    }
+
+    // Auth methods
+    async getAuthUrl(): Promise<string> {
+        const scopes = [
+            'https://www.googleapis.com/auth/calendar',
+            'https://www.googleapis.com/auth/calendar.events'
+        ];
+
+        return this.oauth2Client.generateAuthUrl({
+            access_type: 'offline',
+            scope: scopes,
+            prompt: 'consent'
+        });
+    }
+
+    async handleAuthCallback(code: string) {
         try {
+            const { tokens } = await this.oauth2Client.getToken(code);
+            this.oauth2Client.setCredentials(tokens);
+            this.saveTokens(tokens);
+            this.calendar = google.calendar({ version: 'v3', auth: this.oauth2Client });
+            this.timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            this.isAuthenticated = true;
+            return tokens;
+        } catch (error) {
+            console.error('Error handling auth callback:', error);
+            this.isAuthenticated = false;
+            throw new Error('Failed to authenticate with Google Calendar');
+        }
+    }
+
+    // Calendar Operations
+    async createEvent(parsedCommand: ParsedCommand): Promise<CalendarEvent> {
+        return this.executeWithAuth(async () => {
+            const endTime = this.calculateEndTime(parsedCommand.startTime, parsedCommand.duration);
+            const eventResource = this.createEventResource(parsedCommand, endTime);
+
             const response = await this.calendar.events.insert({
                 calendarId: 'primary',
                 requestBody: eventResource,
                 conferenceDataVersion: 1,
-                sendUpdates: 'all' // Send emails to attendees
+                sendUpdates: 'all'
             });
 
             return response.data as CalendarEvent;
-        } catch (error) {
-            console.error('Error creating calendar event:', error);
-            throw new Error('Failed to create calendar event');
-        }
+        });
     }
 
     async getEvents(startDate?: Date, endDate?: Date): Promise<CalendarEvent[]> {
-        try {
+        return this.executeWithAuth(async () => {
             const response = await this.calendar.events.list({
                 calendarId: 'primary',
                 timeMin: (startDate || new Date()).toISOString(),
@@ -127,83 +241,63 @@ class GoogleCalendarService {
             });
 
             return response.data.items as CalendarEvent[];
-        } catch (error) {
-            console.error('Error fetching events:', error);
-            throw new Error('Failed to fetch calendar events');
-        }
+        });
     }
 
     async getEvent(eventId: string): Promise<CalendarEvent> {
-        try {
+        return this.executeWithAuth(async () => {
             const response = await this.calendar.events.get({
                 calendarId: 'primary',
-                eventId: eventId
+                eventId
             });
 
             return response.data as CalendarEvent;
-        } catch (error) {
-            console.error('Error fetching event:', error);
-            throw new Error('Failed to fetch calendar event');
-        }
+        });
     }
 
     async updateEvent(eventId: string, updates: Partial<ParsedCommand>): Promise<CalendarEvent> {
-        try {
+        return this.executeWithAuth(async () => {
             const currentEvent = await this.getEvent(eventId);
+            const startTime = updates.startTime || new Date(currentEvent.start.dateTime);
+            const duration = updates.duration ||
+                Math.round((new Date(currentEvent.end.dateTime).getTime() -
+                    new Date(currentEvent.start.dateTime).getTime()) / (1000 * 60));
 
-            const endTime = updates.startTime ? new Date(updates.startTime) : new Date(currentEvent.end.dateTime);
-            if (updates.duration) {
-                endTime.setMinutes(endTime.getMinutes() + updates.duration);
-            }
-
-            const eventResource: calendar_v3.Schema$Event = {
-                ...currentEvent,
-                summary: updates.title || currentEvent.summary,
-                description: updates.description || currentEvent.description,
-                start: {
-                    dateTime: updates.startTime?.toISOString() || currentEvent.start.dateTime,
-                    timeZone: this.timeZone,
-                },
-                end: {
-                    dateTime: endTime.toISOString(),
-                    timeZone: this.timeZone,
-                },
-                location: updates.location || currentEvent.location,
-            };
-
-            if (updates.attendees) {
-                eventResource.attendees = updates.attendees.map(attendee => ({ email: attendee }));
-            }
+            const endTime = this.calculateEndTime(startTime, duration);
+            const eventResource = this.createEventResource(
+                {
+                    title: currentEvent.summary,
+                    startTime: new Date(currentEvent.start.dateTime),
+                    duration: duration,
+                    ...updates
+                } as ParsedCommand,
+                endTime,
+                currentEvent
+            );
 
             const response = await this.calendar.events.update({
                 calendarId: 'primary',
-                eventId: eventId,
+                eventId,
                 requestBody: eventResource,
                 sendUpdates: 'all'
             });
 
             return response.data as CalendarEvent;
-        } catch (error) {
-            console.error('Error updating event:', error);
-            throw new Error('Failed to update calendar event');
-        }
+        });
     }
 
     async deleteEvent(eventId: string): Promise<void> {
-        try {
+        return this.executeWithAuth(async () => {
             await this.calendar.events.delete({
                 calendarId: 'primary',
-                eventId: eventId,
+                eventId,
                 sendUpdates: 'all'
             });
-        } catch (error) {
-            console.error('Error deleting event:', error);
-            throw new Error('Failed to delete calendar event');
-        }
+        });
     }
 
     async checkAvailability(startTime: Date, endTime: Date): Promise<boolean> {
-        try {
+        return this.executeWithAuth(async () => {
             const response = await this.calendar.freebusy.query({
                 requestBody: {
                     timeMin: startTime.toISOString(),
@@ -214,64 +308,124 @@ class GoogleCalendarService {
 
             const busySlots = response.data.calendars?.primary?.busy || [];
             return busySlots.length === 0;
-        } catch (error) {
-            console.error('Error checking availability:', error);
-            throw new Error('Failed to check calendar availability');
-        }
+        });
     }
 
     async suggestAlternativeTime(startTime: Date, duration: number): Promise<Date | null> {
-        const endTime = new Date(startTime);
-        endTime.setMinutes(endTime.getMinutes() + duration);
+        return this.executeWithAuth(async () => {
+            const alternatives = await this.findAlternativeSlots(startTime, duration, 1);
+            return alternatives.length > 0 ? alternatives[0] : null;
+        });
+    }
 
-        const weekFromNow = new Date(startTime);
-        weekFromNow.setDate(weekFromNow.getDate() + 7);
+    private async findAlternativeSlots(
+        preferredStart: Date,
+        duration: number,
+        numberOfSlots: number
+    ): Promise<Date[]> {
+        return this.executeWithAuth(async () => {
+            const alternatives: Date[] = [];
+            let currentSlot = new Date(preferredStart);
+            const twoWeeksFromNow = new Date(preferredStart);
+            twoWeeksFromNow.setDate(twoWeeksFromNow.getDate() + 14);
 
-        try {
-            const response = await this.calendar.freebusy.query({
-                requestBody: {
-                    timeMin: startTime.toISOString(),
-                    timeMax: weekFromNow.toISOString(),
-                    items: [{ id: 'primary' }],
-                    timeZone: this.timeZone
-                },
-            });
-
-            const busySlots = response.data.calendars?.primary?.busy || [];
-            let currentSlot = new Date(startTime);
-
-            // Only check during business hours (9 AM to 5 PM)
-            while (currentSlot < weekFromNow) {
-                const slotEnd = new Date(currentSlot);
-                slotEnd.setMinutes(slotEnd.getMinutes() + duration);
-
-                // Skip non-business hours
-                const hour = currentSlot.getHours();
-                if (hour < 9 || hour >= 17) {
-                    currentSlot.setHours(hour < 9 ? 9 : 24);
+            while (alternatives.length < numberOfSlots && currentSlot < twoWeeksFromNow) {
+                if (!this.isBusinessHours(currentSlot)) {
+                    currentSlot.setHours(currentSlot.getHours() < this.BUSINESS_HOURS.start ?
+                        this.BUSINESS_HOURS.start : 24);
                     currentSlot.setMinutes(0);
                     continue;
                 }
 
-                const isSlotBusy = busySlots.some(busy =>
-                    busy.start && busy.end &&
-                    new Date(busy.start) < slotEnd &&
-                    new Date(busy.end) > currentSlot
-                );
+                const slotEnd = this.calculateEndTime(currentSlot, duration);
+                const conflicts = await this.findConflictingEvents(currentSlot, slotEnd);
 
-                if (!isSlotBusy) {
-                    return currentSlot;
+                if (conflicts.length === 0) {
+                    alternatives.push(new Date(currentSlot));
                 }
 
-                // Move to next 30-minute slot
                 currentSlot.setMinutes(currentSlot.getMinutes() + 30);
             }
 
-            return null;
-        } catch (error) {
-            console.error('Error finding alternative time:', error);
-            throw new Error('Failed to find alternative time slot');
-        }
+            return alternatives;
+        });
+    }
+
+    private async findConflictingEvents(
+        startTime: Date,
+        endTime: Date,
+        excludeEventId?: string
+    ): Promise<CalendarEvent[]> {
+        return this.executeWithAuth(async () => {
+            const events = await this.getEvents(startTime, endTime);
+            return events.filter(event =>
+                event.id !== excludeEventId &&
+                this.eventsOverlap(
+                    new Date(event.start.dateTime),
+                    new Date(event.end.dateTime),
+                    startTime,
+                    endTime
+                )
+            );
+        });
+    }
+
+    private eventsOverlap(
+        start1: Date,
+        end1: Date,
+        start2: Date,
+        end2: Date
+    ): boolean {
+        return start1 < end2 && end1 > start2;
+    }
+
+    async updateEventWithConflictCheck(
+        eventId: string,
+        updates: Partial<ParsedCommand>
+    ): Promise<{
+        success: boolean;
+        event?: CalendarEvent;
+        conflicts?: CalendarEvent[];
+        alternativeSlots?: Date[];
+        message?: string;
+    }> {
+        return this.executeWithAuth(async () => {
+            const currentEvent = await this.getEvent(eventId);
+
+            if (currentEvent.recurrence) {
+                return {
+                    success: false,
+                    message: 'This is a recurring event. Would you like to update just this instance or all future events?',
+                    event: currentEvent
+                };
+            }
+
+            const startTime = updates.startTime || new Date(currentEvent.start.dateTime);
+            const duration = updates.duration ||
+                Math.round((new Date(currentEvent.end.dateTime).getTime() -
+                    new Date(currentEvent.start.dateTime).getTime()) / (1000 * 60));
+
+            const endTime = this.calculateEndTime(startTime, duration);
+            const conflictingEvents = await this.findConflictingEvents(startTime, endTime, eventId);
+
+            if (conflictingEvents.length > 0) {
+                const alternativeSlots = await this.findAlternativeSlots(startTime, duration, 3);
+                return {
+                    success: false,
+                    conflicts: conflictingEvents,
+                    alternativeSlots,
+                    message: 'Conflicts found with existing events',
+                    event: currentEvent
+                };
+            }
+
+            const updatedEvent = await this.updateEvent(eventId, updates);
+            return {
+                success: true,
+                event: updatedEvent,
+                message: 'Event updated successfully'
+            };
+        });
     }
 }
 
