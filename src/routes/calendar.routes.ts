@@ -4,24 +4,18 @@ import { authenticateUser as authMiddleware } from '../middleware/auth.middlewar
 
 const router = express.Router();
 
-// Auth routes
-router.get('/auth/url', calendarController.getAuthUrl);
-router.get('/auth/callback', calendarController.handleAuthCallback);
+// All routes use auth middleware
+// router.use(authMiddleware);
+
+// Auth status check
 router.get('/auth/status', calendarController.checkAuthStatus);
 
-// Natural language routes
-router.post('/events/create-from-text', calendarController.createEventFromText);
+// Command endpoint
+router.post('/command', calendarController.handleCommand);
 
-// Standard CRUD routes
-router.post('/events', calendarController.createEvent);
+// Utiity routes for direct API access
 router.get('/events', calendarController.getEvents);
 router.get('/events/:id', calendarController.getEvent);
-router.put('/events/:id', calendarController.updateEvent);
 
-router.delete('/events/:id', calendarController.deleteEvent);
-
-// Calendar availability
-router.get('/availability', calendarController.checkAvailability);
-router.get('/suggest-time', calendarController.suggestAlternativeTime);
 
 export default router;
