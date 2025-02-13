@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { MessageParam } from '@anthropic-ai/sdk/resources';
-import { ParsedCommand, TimeDefaults, EnhancedParsedCommand, Context, Recurrence } from '../types/calendar.types';
+import { ParsedCommand, TimeDefaults, EnhancedParsedCommand, Context, Recurrence, CalendarEvent } from '../types/calendar.types';
+import GoogleCalendarService from './googleCalendar.service';
 
 
 
@@ -8,8 +9,9 @@ class NLPService {
     private client: Anthropic;
     private timeDefaults: TimeDefaults;
     private readonly VERSION = '2.0.0';
+    private googleCalendarService: any;
 
-    constructor() {
+    constructor(googleCalendarService: any) {
         this.client = new Anthropic({
             apiKey: process.env.ANTHROPIC_API_KEY || '',
         });
@@ -21,10 +23,59 @@ class NLPService {
             defaultTime: '09:00',
             defaultDuration: 30
         };
+
+        this.googleCalendarService = googleCalendarService;
+    }
+
+    private readonly MEETING_PATTERNS = {
+        withPerson: /(?:meeting|call|appointment|sync)\s+with\s+(\w+)/i,
+        timeReference: /(tomorrow|next week|later today)/i,
+        moveCommand: /(?:move|reschedule|change)\s+(?:the|my)?\s+(?:meeting|call|appointment|sync)/i,
+    }
+
+
+    private async findTargetMeeting(input: string, patterns: Record<string, RegExp>): Promise<Date | null> {
+        const personMatch = input.match(patterns.withPerson);
+        if (!personMatch) return null;
+
+        const person = personMatch[1];
+        const today = new Date();
+        const tomorrow = new Date(today);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+
+        // Get today's events
+        const events = await this.googleCalendarService.getEvents(
+            today,
+            tomorrow
+        );
+
+        // Find the first event that matches the person's name
+        const targetEvent = events.find((event: CalendarEvent) =>
+            event.summary.toLowerCase().includes(person.toLowerCase()) ||
+            event.attendees?.some(a =>
+                a.email.toLowerCase().includes(person.toLowerCase())
+            )
+        );
+
+        return targetEvent ? new Date(targetEvent.start.dateTime) : null;
     }
 
     async parseCommand(input: string): Promise<EnhancedParsedCommand> {
         try {
+
+            // Add debug logging
+            console.log('Input:', input);
+            console.log('Has Simple Pattern:', this.hasSimplePattern(input));
+
+            // Check if it's a move command
+            if (this.MEETING_PATTERNS.moveCommand.test(input)) {
+                return this.handleMeetingUpdate(input);
+            }
+
+            if (this.hasSimplePattern(input)) {
+                return this.parseWithRegex(input);
+            }
+
             const anthroParsedCommand = await this.parseWithAnthropic(input);
 
             // If confidence is low but regex might work better
@@ -308,10 +359,12 @@ class NLPService {
         const title = this.generateTitle(input, action);
 
         // Parse time with enhanced understanding
-        const { startTime, timeConfidence } = this.parseDateTime(input, patterns);
+        const { startTime, timeConfidence, duration } = this.parseDateTime(input, patterns);
+
+        console.log("Parsed DateTime Result:", startTime, timeConfidence, duration);
 
         // Parse duration with context awareness
-        const duration = this.parseDuration(input, patterns);
+        const finalDuration = duration || this.parseDuration(input, patterns);
 
         // Determine context
         const context = this.determineContext(input, patterns);
@@ -326,7 +379,7 @@ class NLPService {
             action,
             title,
             startTime,
-            duration,
+            duration: finalDuration,
             description: input,
             queryType,
             confidence,
@@ -386,14 +439,31 @@ class NLPService {
         if (/tomorrow|tmr|tmrw|next day/i.test(input)) {
             startTime.setDate(startTime.getDate() + 1);
             timeConfidence = 0.9;
+        } else if (/next week/i.test(input)) {
+            startTime.setDate(startTime.getDate() + 7);
+            timeConfidence = 0.9;
+        } else if (/next month/i.test(input)) {
+            startTime.setMonth(startTime.getMonth() + 1);
+            timeConfidence = 0.9;
         }
 
-        // Improved time range pattern
+        // Improved time range pattern - make it more specific
         const timeRangePattern = /(?:from\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)?\s+(?:to|until|till|-)\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)?/i;
         const timeMatch = input.match(timeRangePattern);
 
+        console.log("Time Range Match:", timeMatch);
+
         if (timeMatch) {
             const [_, startHour, startMin, startAmPm, endHour, endMin, endAmPm] = timeMatch;
+
+            console.log('Parsed Time Components:', {
+                startHour,
+                startMin,
+                startAmPm,
+                endHour,
+                endMin,
+                endAmPm
+            });
 
             // Parse start time
             let hours = parseInt(startHour);
@@ -421,23 +491,32 @@ class NLPService {
                     endHours = 0;
                 }
 
-                // Handle cases where end time is on the next day
+                // Create end time date
+                const endTimeDate = new Date(startTime);
+                endTimeDate.setHours(endHours, endMinutes);
+
+                // If end time is earlier than start time, assume it's next day
                 if (endHours < hours || (endHours === hours && endMinutes < minutes)) {
-                    endHours += 24;
+                    endTimeDate.setDate(endTimeDate.getDate() + 1);
                 }
 
                 // Calculate duration in minutes
-                const durationMinutes = ((endHours - hours) * 60) + (endMinutes - minutes);
+                const durationMinutes = Math.round((endTimeDate.getTime() - startTime.getTime()) / (1000 * 60));
 
-                return {
-                    startTime,
-                    timeConfidence,
-                    duration: durationMinutes > 0 ? durationMinutes : this.timeDefaults.defaultDuration
-                };
+                console.log('Calculated Times:', {
+                    startTime: startTime.toISOString(),
+                    endTime: endTimeDate.toISOString(),
+                    durationMinutes
+                });
+
+                return { startTime, timeConfidence, duration: durationMinutes };
             }
         }
+
+        // If no time range is found, return default duration
         return { startTime, timeConfidence, duration: this.timeDefaults.defaultDuration };
     }
+
 
 
     private parseDuration(input: string, patterns: Record<string, RegExp>): number {
@@ -462,17 +541,14 @@ class NLPService {
     }
 
     private determineContext(input: string, patterns: Record<string, RegExp>): Context {
-        const isUrgent = patterns.urgency.test(input);
-        const flexMatch = input.match(patterns.flexibility);
-        const isFlexible = flexMatch ? !flexMatch[0].includes('must be') : true;
-
-        return {
-            isUrgent,
-            isFlexible,
-            priority: isUrgent ? 'high' : 'normal',
-            timePreference: input.includes('exactly') ? 'exact' :
-                isFlexible ? 'flexible' : 'approximate'
+        const context: Context = {
+            isUrgent: /urgent|asap|immediately|right away/i.test(input),
+            isFlexible: /flexible|anytime|whenever/i.test(input),
+            priority: /high priority|important|critical/i.test(input) ? 'high' : 'normal',
+            timePreference: /exactly|sharp|on the dot/i.test(input) ? 'exact' : 'approximate'
         };
+
+        return context;
     }
 
     private parseRecurrence(input: string, patterns: Record<string, RegExp>): Recurrence | undefined {
@@ -616,6 +692,7 @@ class NLPService {
         }
     }
 
+
     private validateCreateCommand(command: ParsedCommand): boolean {
         return !!(command.title && command.startTime && command.duration && command.duration > 0);
     }
@@ -632,6 +709,74 @@ class NLPService {
     private validateQueryCommand(command: ParsedCommand): boolean {
         return !!(command.startTime && command.queryType);
     }
+
+    private async handleMeetingUpdate(input: string): Promise<EnhancedParsedCommand> {
+        // Extract person name and time reference
+        const personMatch = input.match(this.MEETING_PATTERNS.withPerson);
+        const timeMatch = input.match(this.MEETING_PATTERNS.timeReference);
+
+        if (!personMatch) {
+            throw new Error('Could not identify meeting participant');
+        }
+
+        // Find the target meeting
+        const targetMeeting = await this.findTargetMeeting(input, this.MEETING_PATTERNS);
+        if (!targetMeeting) {
+            throw new Error(`No meeting found with ${personMatch[1]}`);
+        }
+
+        // Calculate new time
+        const newStartTime = this.calculateNewTime(timeMatch ? timeMatch[1] : '', targetMeeting);
+
+        return {
+            action: 'update',
+            title: `Meeting with ${personMatch[1]}`,
+            startTime: newStartTime,
+            targetTime: targetMeeting,
+            duration: 30, // Default duration or get from original meeting
+            description: input,
+            confidence: 0.9,
+            context: {
+                isUrgent: false,
+                isFlexible: true,
+                priority: 'normal',
+                timePreference: 'approximate'
+            },
+            metadata: {
+                originalText: input,
+                parseTime: new Date(),
+                parserVersion: this.VERSION,
+                confidence: 0.9
+            },
+            ambiguityResolution: {
+                assumedDefaults: [],
+                clarificationNeeded: false,
+                alternativeInterpretations: [],
+                confidenceReasons: ['Explicit move command detected', 'Person identified', 'Target meeting found'],
+                missingInformation: []
+            }
+        };
+    }
+
+    private calculateNewTime(timeReference: string, originalTime: Date): Date {
+        const newTime = new Date(originalTime);
+
+        switch (timeReference.toLowerCase()) {
+            case 'tomorrow':
+                newTime.setDate(newTime.getDate() + 1);
+                break;
+            case 'next week':
+                newTime.setDate(newTime.getDate() + 7);
+                break;
+            case 'later today':
+                newTime.setHours(newTime.getHours() + 3); // Move 3 hours later
+                break;
+            default:
+                newTime.setDate(newTime.getDate() + 1); // Default to tomorrow
+        }
+
+        return newTime;
+    }
 }
 
-export default new NLPService();
+export default new NLPService(GoogleCalendarService);

@@ -31,7 +31,7 @@ const threadSchema = new Schema<IThread>({
   userId: {
     type: Schema.Types.ObjectId,
     ref: 'User',
-    required: false,
+    required: true,
   },
 });
 export default mongoose.model<IThread>('Thread', threadSchema);

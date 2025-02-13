@@ -13,12 +13,12 @@ import { errorHandler } from '../middleware/error.middleware';
 
 const router = express.Router();
 
-router.get('/google/connect',  initiateGoogleAuth);
+router.get('/google/connect', initiateGoogleAuth);
 router.get('/google/callback', handleGoogleCallback);
 router.post('/logout', logout);
 
 // Status check route
-router.get('/status', authenticateUser, getAuthStatus);
+router.get('/status', getAuthStatus);
 
 router.use(errorHandler);
 
