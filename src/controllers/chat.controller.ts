@@ -55,8 +55,17 @@ export const addMessage = async (req: Request, res: Response) => {
             return res.status(404).json({ error: 'Thread not found' });
         }
 
+        // Get previous messages for context
+        const previousMessages = thread.messages.map(msg =>({
+            role: msg.sender,
+            content: msg.content
+        }))
+
         // Get response from NLP service
-        const parsedCommand = await nlpService.parseCommand(message);
+        const parsedCommand = await nlpService.parseCommand(message, {
+            previousMessages,
+            threadId
+        });
 
         // Add both user message and bot response
         thread.messages.push(

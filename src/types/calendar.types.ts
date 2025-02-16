@@ -8,8 +8,14 @@ export interface ParsedCommand {
     attendees?: string[];
     targetTime?: Date;
     changes?: Record<string, any>;
-    queryType?: 'availability' | 'event_details'; 
+    queryType?: 'availability' | 'event_details';
 }
+
+export interface ParseCommandOptions {
+    previousMessages?: Array<{ role: string; content: string }>;
+    threadId?: string;
+}
+
 
 export interface CalendarEvent {
     id: string;

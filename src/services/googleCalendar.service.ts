@@ -70,20 +70,76 @@ class GoogleCalendarService {
     }
 
     private async handleUpdateCommand(parsedCommand: EnhancedParsedCommand) {
-        const events = await this.getEvents(parsedCommand.targetTime, parsedCommand.targetTime);
+        // Get all events for today and tomorrow
+        const now = new Date();
+        const dayStart = new Date(now);
+        dayStart.setHours(0, 0, 0, 0);
+
+        const dayEnd = new Date(now);
+        dayEnd.setDate(dayEnd.getDate() + 2); // 2 days in the future
+        dayEnd.setHours(23, 59, 59, 999);
+
+        // Extract the actual event title from the command
+        const titleMatch = parsedCommand.title.match(/(?:change|update|move|reschedule).*(?:for|of)\s+(.+?)\s+to/i);
+        const searchTitle = titleMatch ? titleMatch[1] : parsedCommand.title;
+
+        console.log('Searching for events between:', {
+            dayStart: dayStart.toISOString(),
+            dayEnd: dayEnd.toISOString(),
+            searchTitle: parsedCommand.title
+        });
+
+        const events = await this.getEvents(dayStart, dayEnd);
+        console.log('Found events:', events.map(e => ({
+            title: e.summary,
+            start: e.start.dateTime,
+            end: e.end.dateTime
+        })));
+
+        // Find event by title match or time match
         const targetEvent = events.find(event => {
             const eventStart = new Date(event.start.dateTime);
-            return this.compareDates(eventStart, parsedCommand.targetTime!);
+            const titleMatch = event.summary.toLowerCase().includes(searchTitle.toLowerCase());
+            const timeMatch = parsedCommand.targetTime ?
+                this.compareDates(eventStart, parsedCommand.targetTime) :
+                false;
+            return titleMatch || timeMatch;
         });
 
         if (!targetEvent) {
             return {
                 success: false,
-                error: 'No event found at the specified time'
+                error: 'Could not find a matching event to update. Please specify the event title or time more clearly.'
             };
         }
 
-        const result = await this.updateEventWithConflictCheck(targetEvent.id, parsedCommand);
+        // Calculate new start and end times
+        const originalStart = new Date(targetEvent.start.dateTime);
+        const originalEnd = new Date(targetEvent.end.dateTime);
+        const duration = parsedCommand.duration ||
+            Math.round((originalEnd.getTime() - originalStart.getTime()) / (1000 * 60));
+
+        let newStartTime: Date;
+        if (parsedCommand.startTime) {
+            // If a specific new time was provided
+            newStartTime = new Date(parsedCommand.startTime);
+        } else {
+            // If only the date was changed, maintain the same time of day
+            newStartTime = new Date(now);
+            newStartTime.setHours(
+                originalStart.getHours(),
+                originalStart.getMinutes(),
+                originalStart.getSeconds()
+            );
+        }
+
+        const result = await this.updateEventWithConflictCheck(targetEvent.id, {
+            ...parsedCommand,
+            startTime: newStartTime,
+            duration: duration,
+            title: targetEvent.summary // Preserve original title if not specified in update
+        });
+
         return {
             success: result.success,
             event: result.event,
@@ -280,7 +336,7 @@ class GoogleCalendarService {
     // Utility methods
     private buildDescription(parsedCommand: EnhancedParsedCommand): string {
         const parts = [parsedCommand.description || ''];
-        
+
         if (parsedCommand.context?.isUrgent) {
             parts.push('⚠️ High Priority Event');
         }
@@ -303,7 +359,7 @@ class GoogleCalendarService {
     private buildRecurrenceRule(recurrence: Recurrence): string[] {
         const freq = recurrence.pattern.toUpperCase();
         const rules = [`RRULE:FREQ=${freq};INTERVAL=${recurrence.interval}`];
-        
+
         if (recurrence.until) {
             rules[0] += `;UNTIL=${new Date(recurrence.until).toISOString().replace(/[-:]/g, '').split('.')[0]}Z`;
         }
@@ -313,11 +369,11 @@ class GoogleCalendarService {
 
     private determineEventStatus(context?: Context): string {
         if (!context) return 'confirmed';
-        
+
         if (context.timePreference === 'flexible') {
             return 'tentative';
         }
-        
+
         return 'confirmed';
     }
 
@@ -355,10 +411,10 @@ class GoogleCalendarService {
 
     private compareDates(date1: Date, date2: Date): boolean {
         return date1.getFullYear() === date2.getFullYear() &&
-               date1.getMonth() === date2.getMonth() &&
-               date1.getDate() === date2.getDate() &&
-               date1.getHours() === date2.getHours() &&
-               date1.getMinutes() === date2.getMinutes();
+            date1.getMonth() === date2.getMonth() &&
+            date1.getDate() === date2.getDate() &&
+            date1.getHours() === date2.getHours() &&
+            date1.getMinutes() === date2.getMinutes();
     }
 
     async checkAvailability(startTime: Date, endTime: Date): Promise<boolean> {
@@ -401,7 +457,7 @@ class GoogleCalendarService {
 
             while (alternatives.length < numberOfSlots && currentSlot < twoWeeksFromNow) {
                 if (!context?.isFlexible && !this.isBusinessHours(currentSlot)) {
-                    currentSlot.setHours(currentSlot.getHours() < this.BUSINESS_HOURS.start ? 
+                    currentSlot.setHours(currentSlot.getHours() < this.BUSINESS_HOURS.start ?
                         this.BUSINESS_HOURS.start : 24);
                     currentSlot.setMinutes(0);
                     continue;
@@ -449,7 +505,7 @@ class GoogleCalendarService {
         if (conflicts.length === 0) return true;
         if (!context?.isFlexible) return false;
 
-        return conflicts.every(conflict => 
+        return conflicts.every(conflict =>
             conflict.transparency === 'transparent' ||
             conflict.status === 'tentative'
         );
