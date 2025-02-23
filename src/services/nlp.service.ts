@@ -2,6 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { MessageParam } from '@anthropic-ai/sdk/resources';
 import { ParsedCommand, ParseCommandOptions, TimeDefaults, EnhancedParsedCommand, Context, Recurrence, CalendarEvent } from '../types/calendar.types';
 import GoogleCalendarService from './googleCalendar.service';
+import { UserPreferences } from '../models';
 
 
 
@@ -44,6 +45,12 @@ class NLPService {
             console.log('Extracted event title:', title);
         }
 
+        // Find the target meeting based on the person's name
+        const targetMeetingTime = await this.findTargetMeeting(input, this.MEETING_PATTERNS);
+        if (!targetMeetingTime) {
+            throw new Error('Target meeting not found');
+        }
+
         // Rest of parsing logic...
         const { startTime, timeConfidence, duration } = this.parseDateTime(input, this.MEETING_PATTERNS);
 
@@ -52,7 +59,7 @@ class NLPService {
             title: title,
             startTime: startTime,
             targetTime: startTime,
-            confidence: timeConfidence,
+            timeConfidence: timeConfidence,
             duration: duration || this.timeDefaults.defaultDuration,
             metadata: {
                 originalText: input,
@@ -123,7 +130,23 @@ class NLPService {
                     : anthroParsedCommand;
             }
 
-            return anthroParsedCommand;
+            // Extract video conference link
+            const videoLinkPattern = /(https?:\/\/[^\s]+)/i;
+            const videoLinkMatch = input.match(videoLinkPattern);
+            const videoLink = videoLinkMatch ? videoLinkMatch[0] : undefined;
+
+            // Remove video link from input
+            const cleanedInput = videoLink ? input.replace(videoLinkPattern, '').trim() : input;
+
+            // Parse the cleaned input
+            const finalParsedCommand = await this.parseWithAnthropic(cleanedInput, options);
+
+            if (videoLink) {
+                anthroParsedCommand.videoLink = videoLink;
+            }
+
+
+            return finalParsedCommand;
         } catch (error) {
             console.warn('Anthropic API failed, falling back to regex-based parser:', error);
             return this.parseWithRegex(input);
@@ -144,9 +167,14 @@ class NLPService {
         return initialParse;
     }
 
-    private async parseWithAnthropic(input: string, context?: { previousMessages?: any[], threadId?: string }): Promise<EnhancedParsedCommand> {
-        const userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    private async parseWithAnthropic(input: string, context?: { previousMessages?: any[], threadId?: string, userId?: string }): Promise<EnhancedParsedCommand> {
+        const userTimezone = await this.getUserTimezone(context?.userId);
         const currentTime = new Date();
+
+
+        //  debug logging
+        console.log('User Timezone:', userTimezone);
+        console.log('Current Time:', currentTime.toLocaleString());
 
         const conversationContext = context?.previousMessages?.map((msg => `${msg.role}: ${msg.content}`)).join('\n') || '';
 
@@ -192,6 +220,29 @@ class NLPService {
     ${conversationContext}
     
     COMMAND INTERPRETATION GUIDELINES:
+
+Key requirements:
+- Parse specific dates like "Tuesday 25th February" into exact ISO dates with the correct year
+- Validate that parsed dates match specified days of the week
+- Handle time specifications in 12-hour format (e.g., "12pm")
+- Default to next occurrence if date is in the future
+- Return all times in ISO format with timezone
+- Include confidence scores (0-1) for date/time parsing accuracy
+
+Example input: "schedule an interview with Jay Jaffar from Fortive for Tuesday 25th February at 12pm"
+Example output: {
+    "action": "create",
+    "title": "Interview with Jay Jaffar from Fortive",
+    "startTime": "2025-02-25T12:00:00.000Z",
+    "duration": 30,
+    "confidence": 0.95,
+    "context": {
+        "isUrgent": false,
+        "isFlexible": false,
+        "priority": "normal",
+        "timePreference": "exact"
+    }
+}
     
     1. Action Classification:
        CREATE:
@@ -333,6 +384,53 @@ class NLPService {
         try {
             const parsedResponse = JSON.parse(text);
 
+            console.log('Parsed Response:', parsedResponse);
+
+            // Validate the parsed date matches the day of week
+            if (parsedResponse.startTime) {
+                const date = new Date(parsedResponse.startTime);
+
+                // Extract date components from input
+                const dateInfo = {
+                    hasExplicitYear: !!input.match(/\b\d{4}\b/),
+                    hasExplicitMonth: !!input.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/i),
+                    hasExplicitDay: !!input.match(/\b(\d{1,2})(st|nd|rd|th)?\b/),
+                    hasNext: !!input.match(/\b(next|coming)\b/i),
+                    specifiedDay: input.match(/(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i)?.[1]
+                };
+
+                console.log('Date parsing info:', dateInfo);
+
+                // Validate day of week if specified
+                if (dateInfo.specifiedDay) {
+                    const actualDay = date.toLocaleDateString('en-US', { weekday: 'long' });
+                    if (!this.validateDateWithDayOfWeek(date, dateInfo.specifiedDay)) {
+                        console.warn(`Day mismatch: specified ${dateInfo.specifiedDay}, but date falls on ${actualDay}`);
+                        throw new Error(`The specified date (${date.toDateString()}) falls on ${actualDay}, not ${dateInfo.specifiedDay}`);
+                    }
+                }
+
+                // Determine if we should adjust the date
+                const shouldAdjustDate = !dateInfo.hasExplicitYear ||
+                    (dateInfo.hasNext && !dateInfo.hasExplicitMonth) ||
+                    (!dateInfo.hasExplicitMonth && !dateInfo.hasExplicitDay);
+
+                if (shouldAdjustDate && dateInfo.specifiedDay) {
+                    console.log('Adjusting date to next occurrence');
+                    parsedResponse.startTime = this.adjustDateToNextOccurrence(date, dateInfo.specifiedDay);
+                }
+
+                // Validate the final date is not in the past
+                const now = new Date();
+                if (parsedResponse.startTime < now) {
+                    console.warn('Adjusted date is in the past, moving to next year');
+                    parsedResponse.startTime.setFullYear(parsedResponse.startTime.getFullYear() + 1);
+                }
+
+                // Add confidence adjustments based on date specificity
+                parsedResponse.confidence = this.calculateDateConfidence(dateInfo);
+            }
+
             // Validate required fields
             if (!parsedResponse.action || !parsedResponse.title || !parsedResponse.startTime || !parsedResponse.duration) {
                 throw new Error('Missing required fields in parsed response');
@@ -410,36 +508,36 @@ class NLPService {
             meetingType: /quick sync|catch-up|check-in|meeting|call|review|workshop|training|1:1|one on one/i
         };
 
-           // Check for recurring patterns first
-    if (input.toLowerCase().includes('every') || input.toLowerCase().includes('weekly')) {
-        const recurringDateTime = this.parseRecurringDateTime(input, patterns);
-        return {
-            action: 'create',
-            title: this.generateTitle(input, 'create'),
-            startTime: recurringDateTime.startTime,
-            duration: recurringDateTime.duration || this.timeDefaults.defaultDuration,
-            confidence: recurringDateTime.timeConfidence,
-            description: input,
-            recurrence: {
-                pattern: 'weekly',
-                interval: 1
-            },
-            context: this.determineContext(input, patterns),
-            metadata: {
-                originalText: input,
-                parseTime: new Date(),
-                parserVersion: this.VERSION,
-                confidence: recurringDateTime.timeConfidence
-            },
-            ambiguityResolution: {
-                assumedDefaults: [],
-                clarificationNeeded: false,
-                alternativeInterpretations: [],
-                confidenceReasons: ['Recurring pattern detected'],
-                missingInformation: []
-            }
-        };
-    }
+        // Check for recurring patterns first
+        if (input.toLowerCase().includes('every') || input.toLowerCase().includes('weekly')) {
+            const recurringDateTime = this.parseRecurringDateTime(input, patterns);
+            return {
+                action: 'create',
+                title: this.generateTitle(input, 'create'),
+                startTime: recurringDateTime.startTime,
+                duration: recurringDateTime.duration || this.timeDefaults.defaultDuration,
+                timeConfidence: recurringDateTime.timeConfidence,
+                description: input,
+                recurrence: {
+                    pattern: 'weekly',
+                    interval: 1
+                },
+                context: this.determineContext(input, patterns),
+                metadata: {
+                    originalText: input,
+                    parseTime: new Date(),
+                    parserVersion: this.VERSION,
+                    confidence: recurringDateTime.timeConfidence
+                },
+                ambiguityResolution: {
+                    assumedDefaults: [],
+                    clarificationNeeded: false,
+                    alternativeInterpretations: [],
+                    confidenceReasons: ['Recurring pattern detected'],
+                    missingInformation: []
+                }
+            };
+        }
 
         // Determine action type with enhanced patterns
         const action: 'create' | 'update' | 'delete' | 'query' = this.determineAction(input, patterns);
@@ -478,7 +576,7 @@ class NLPService {
             duration: finalDuration,
             description: input,
             queryType,
-            confidence,
+            timeConfidence,
             context,
             recurrence,
             metadata: {
@@ -516,22 +614,125 @@ class NLPService {
     }
 
     private generateTitle(input: string, action: string): string {
-        // Remove time-related phrases from the title
-        const timePattern = /(?:from|at|on)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?(?:\s+to\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?/i;
-        const cleanedInput = input.replace(timePattern, '').trim();
+        // Remove video links
+        const videoLinkPattern = /(?:here'?s?\s+(?:the\s+)?(?:video\s+)?link:?\s+)?https?:\/\/[^\s]+/gi;
+        let cleanedInput = input.replace(videoLinkPattern, '');
+        // Remove time-related phrases
+        const timePatterns = [
+            /(?:from|at|on)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?(?:\s+to\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?/i,
+            /(?:today|tomorrow|next week|this week|tonight)/i,
+            /for\s+(?:today|tomorrow|next week|this week|tonight)/i,
+            /\s+for\s*$/i  // Matches "for" at the end of the string
+        ];
 
-        // Remove common scheduling words
+        timePatterns.forEach(pattern => {
+            cleanedInput = cleanedInput.replace(pattern, '');
+        });
+
+        // Remove scheduling words
         const schedulingWords = /(?:schedule|create|add|set up|book)\s+/i;
-        const finalTitle = cleanedInput.replace(schedulingWords, '').trim();
+        let finalTitle = cleanedInput.replace(schedulingWords, '').trim();
+
+        // Remove any trailing "for" that might be left
+        finalTitle = finalTitle.replace(/\s+for\s*$/i, '');
 
         return finalTitle || 'Untitled Event';
     }
 
-    private parseDateTime(input: string, patterns: Record<string, RegExp>): { startTime: Date; timeConfidence: number; duration?: number } {
+    private parseDateTime(input: string, patterns: Record<string, RegExp>): {
+        startTime: Date;
+        timeConfidence: number;
+        duration?: number;
+        timeZone?: string;
+    } {
         const startTime = new Date();
         let timeConfidence = 0.8;
+        let duration: number | undefined;
 
-        // Handle relative dates
+        // Define relative time expressions
+        const relativePatterns = {
+            'end of day': () => {
+                startTime.setHours(17, 0, 0, 0); // Default to 5 PM
+                timeConfidence = 0.9;
+                duration = 60;
+            },
+            'beginning of next month': () => {
+                startTime.setMonth(startTime.getMonth() + 1, 1);
+                startTime.setHours(9, 0, 0, 0); // Default to 9 AM
+                timeConfidence = 0.95;
+                duration = 60;
+            },
+            'lunch time': () => {
+                startTime.setHours(12, 0, 0, 0);
+                timeConfidence = 0.85;
+                duration = 60;
+            },
+            'morning': () => {
+                startTime.setHours(9, 0, 0, 0);
+                timeConfidence = 0.7;
+                duration = 60;
+            },
+            'afternoon': () => {
+                startTime.setHours(14, 0, 0, 0);
+                timeConfidence = 0.7;
+                duration = 60;
+            },
+            'evening': () => {
+                startTime.setHours(18, 0, 0, 0);
+                timeConfidence = 0.7;
+                duration = 60;
+            }
+        };
+
+        // Check for specific date patterns
+        const datePattern = /(\w+day),?\s+(\w+)\s+(\d{1,2}),?\s+(\d{4})/i;
+        const dateMatch = input.match(datePattern);
+        if (dateMatch) {
+            const [_, dayOfWeek, month, day, year] = dateMatch;
+            const targetDate = new Date(`${month} ${day}, ${year}`);
+            const specifiedDay = dayOfWeek.toLowerCase();
+
+            if (this.validateDateWithDayOfWeek(targetDate, specifiedDay)) {
+                startTime.setFullYear(targetDate.getFullYear());
+                startTime.setMonth(targetDate.getMonth());
+                startTime.setDate(targetDate.getDate());
+                timeConfidence = 0.95;
+            } else {
+                console.warn('Parsed date does not match specified day of week');
+                return this.parseWithRegex(input);
+            }
+        }
+
+        // Check for relative time expressions
+        for (const [pattern, handler] of Object.entries(relativePatterns)) {
+            if (input.toLowerCase().includes(pattern)) {
+                handler();
+                return { startTime, timeConfidence, duration };
+            }
+        }
+
+        // Fuzzy time matching
+        const fuzzyTimePatterns = {
+            'around noon': { hour: 12, confidence: 0.8 },
+            'early morning': { hour: 8, confidence: 0.7 },
+            'mid morning': { hour: 10, confidence: 0.7 },
+            'late morning': { hour: 11, confidence: 0.7 },
+            'early afternoon': { hour: 13, confidence: 0.7 },
+            'late afternoon': { hour: 16, confidence: 0.7 },
+            'early evening': { hour: 17, confidence: 0.7 },
+            'late evening': { hour: 20, confidence: 0.7 }
+        };
+
+        for (const [pattern, config] of Object.entries(fuzzyTimePatterns)) {
+            if (input.toLowerCase().includes(pattern)) {
+                startTime.setHours(config.hour, 0, 0, 0);
+                timeConfidence = config.confidence;
+                duration = 60;
+                return { startTime, timeConfidence, duration };
+            }
+        }
+
+        // Handle relative days
         if (/tomorrow|tmr|tmrw|next day/i.test(input)) {
             startTime.setDate(startTime.getDate() + 1);
             timeConfidence = 0.9;
@@ -543,23 +744,22 @@ class NLPService {
             timeConfidence = 0.9;
         }
 
-        // Improved time range pattern - make it more specific
+        // Time zone handling
+        const timeZonePattern = /in|at\s+([\w\s/]+time zone|GMT[+-]\d+|UTC[+-]\d+)/i;
+        const timeZoneMatch = input.match(timeZonePattern);
+        let timeZone: string | undefined;
+
+        if (timeZoneMatch) {
+            timeZone = timeZoneMatch[1];
+            timeConfidence += 0.1; // Increase confidence when timezone is specified
+        }
+
+        // Improved time range pattern
         const timeRangePattern = /(?:from\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)?\s+(?:to|until|till|-)\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)?/i;
         const timeMatch = input.match(timeRangePattern);
 
-        console.log("Time Range Match:", timeMatch);
-
         if (timeMatch) {
             const [_, startHour, startMin, startAmPm, endHour, endMin, endAmPm] = timeMatch;
-
-            console.log('Parsed Time Components:', {
-                startHour,
-                startMin,
-                startAmPm,
-                endHour,
-                endMin,
-                endAmPm
-            });
 
             // Parse start time
             let hours = parseInt(startHour);
@@ -592,25 +792,40 @@ class NLPService {
                 endTimeDate.setHours(endHours, endMinutes);
 
                 // If end time is earlier than start time, assume it's next day
-                if (endHours < hours || (endHours === hours && endMinutes < minutes)) {
+                if (endTimeDate < startTime) {
                     endTimeDate.setDate(endTimeDate.getDate() + 1);
                 }
 
                 // Calculate duration in minutes
-                const durationMinutes = Math.round((endTimeDate.getTime() - startTime.getTime()) / (1000 * 60));
-
-                console.log('Calculated Times:', {
-                    startTime: startTime.toISOString(),
-                    endTime: endTimeDate.toISOString(),
-                    durationMinutes
-                });
-
-                return { startTime, timeConfidence, duration: durationMinutes };
+                duration = Math.round((endTimeDate.getTime() - startTime.getTime()) / (1000 * 60));
             }
         }
 
-        // If no time range is found, return default duration
-        return { startTime, timeConfidence, duration: this.timeDefaults.defaultDuration };
+        // Specific time pattern
+        const specificTimePattern = /at\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)?/i;
+        const specificTimeMatch = input.match(specificTimePattern);
+
+        if (specificTimeMatch) {
+            let [fullMatch, hourStr, minuteStr, ampm] = specificTimeMatch;
+            let hour = parseInt(hourStr);
+            let minute = minuteStr ? parseInt(minuteStr) : 0;
+
+            if (ampm?.toLowerCase() === 'pm' && hour < 12) {
+                hour += 12;
+            } else if (ampm?.toLowerCase() === 'am' && hour === 12) {
+                hour = 0;
+            }
+
+            startTime.setHours(hour, minute, 0, 0);
+            timeConfidence = 0.95;
+        }
+
+        return {
+            startTime,
+            timeConfidence,
+            duration: duration || this.timeDefaults.defaultDuration,
+            timeZone
+        };
     }
 
 
@@ -723,8 +938,21 @@ class NLPService {
     }
 
     private convertToLocalTime(isoString: string, timezone: string): Date {
-        const date = new Date(isoString);
-        return new Date(date.toLocaleString('en-US', { timeZone: timezone }));
+        // Create a date object in the target timezone
+        const targetDate = new Date(isoString);
+
+        // Get the UTC timestamp
+        const utcTimestamp = targetDate.getTime();
+
+        // Get the target timezone offset in minutes
+        const targetOffset = new Date(targetDate.toLocaleString('en-US', { timeZone: timezone })).getTimezoneOffset();
+
+        // Get the local timezone offset in minutes
+        const localOffset = targetDate.getTimezoneOffset();
+
+        // Calculate the difference and adjust the time
+        const offsetDiff = localOffset - targetOffset;
+        return new Date(utcTimestamp + (offsetDiff * 60000));
     }
 
     private validateEnhancedParsedCommand(command: EnhancedParsedCommand): boolean {
@@ -810,34 +1038,74 @@ class NLPService {
         // Extract title from the move/reschedule command
         const moveMatch = input.match(this.MEETING_PATTERNS.moveCommand);
         let title = input;
-    
+
         if (moveMatch && moveMatch[1]) {
             title = moveMatch[1].trim();
         }
-    
+
         // Get today's and tomorrow's events
         const today = new Date();
         const tomorrow = new Date(today);
         tomorrow.setDate(tomorrow.getDate() + 2);
-    
+
         // Get events
         const events = await this.googleCalendarService.getEvents(
             today,
             tomorrow
         );
-    
+
         // Find the target event by title
         const targetEvent = events.find((event: CalendarEvent) =>
             event.summary.toLowerCase().includes(title.toLowerCase())
         );
-    
+
         if (!targetEvent) {
             throw new Error(`No event found matching "${title}"`);
         }
-    
+
+
+
         // Parse the new date/time
         const { startTime, timeConfidence, duration } = this.parseDateTime(input, this.MEETING_PATTERNS);
-    
+
+        // Use calculateNewTime as a fallback if parseDateTime doesn't find a specific time
+        if (!startTime || startTime.getTime() === today.getTime()) {
+            const timeReference = input.match(this.MEETING_PATTERNS.timeReference)?.[1];
+            if (timeReference) {
+                const calculatedTime = this.calculateNewTime(timeReference, new Date(targetEvent.start.dateTime));
+                return {
+                    action: 'update',
+                    title: targetEvent.summary,
+                    startTime: calculatedTime,
+                    targetTime: new Date(targetEvent.start.dateTime),
+                    duration: duration || this.timeDefaults.defaultDuration,
+                    description: input,
+                    timeConfidence: 0.9, // High confidence when using explicit time reference
+                    context: {
+                        isUrgent: false,
+                        isFlexible: true,
+                        priority: 'normal',
+                        timePreference: 'approximate'
+                    },
+                    metadata: {
+                        originalText: input,
+                        parseTime: new Date(),
+                        parserVersion: this.VERSION,
+                        confidence: 0.9
+                    },
+                    ambiguityResolution: {
+                        assumedDefaults: [],
+                        clarificationNeeded: false,
+                        alternativeInterpretations: [],
+                        confidenceReasons: ['Explicit time reference detected', 'Target event found'],
+                        missingInformation: []
+                    }
+                };
+            }
+        }
+
+
+
         return {
             action: 'update',
             title: targetEvent.summary,
@@ -845,7 +1113,7 @@ class NLPService {
             targetTime: new Date(targetEvent.start.dateTime),
             duration: duration || this.timeDefaults.defaultDuration,
             description: input,
-            confidence: timeConfidence,
+            timeConfidence: timeConfidence,
             context: {
                 isUrgent: false,
                 isFlexible: true,
@@ -891,35 +1159,35 @@ class NLPService {
     private parseRecurringDateTime(input: string, patterns: Record<string, RegExp>): { startTime: Date; timeConfidence: number; duration?: number } {
         const startTime = new Date();
         let timeConfidence = 0.9;
-        
+
         // Parse time
         const timePattern = /at\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)?/i;
         const timeMatch = input.match(timePattern);
-        
+
         if (timeMatch) {
             const [_, hours, minutes, meridiem] = timeMatch;
             let parsedHours = parseInt(hours);
-            
+
             // Handle AM/PM
             if (meridiem?.toLowerCase() === 'pm' && parsedHours < 12) {
                 parsedHours += 12;
             } else if (meridiem?.toLowerCase() === 'am' && parsedHours === 12) {
                 parsedHours = 0;
             }
-            
+
             startTime.setHours(parsedHours, minutes ? parseInt(minutes) : 0, 0, 0);
             timeConfidence = 0.95;
         }
-        
+
         // Parse day of week
         const dayPattern = /every\s+(\w+day)/i;
         const dayMatch = input.match(dayPattern);
-        
+
         if (dayMatch) {
             const targetDay = dayMatch[1].toLowerCase();
             const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
             const targetDayIndex = days.indexOf(targetDay);
-            
+
             if (targetDayIndex !== -1) {
                 const currentDay = startTime.getDay();
                 const daysToAdd = (targetDayIndex + 7 - currentDay) % 7;
@@ -927,7 +1195,7 @@ class NLPService {
                 timeConfidence = Math.min(timeConfidence + 0.05, 1);
             }
         }
-        
+
         // Determine duration based on meeting type
         let duration = 30; // default
         if (input.toLowerCase().includes('sync')) {
@@ -937,8 +1205,67 @@ class NLPService {
         } else if (input.toLowerCase().includes('training')) {
             duration = 120;
         }
-        
+
         return { startTime, timeConfidence, duration };
+    }
+
+    private async getUserTimezone(userId?: string): Promise<string> {
+        if (userId) {
+            const userPrefs = await UserPreferences.findOne({ userId });
+            if (userPrefs?.timeZone) {
+                return userPrefs.timeZone;
+            }
+        }
+        return Intl.DateTimeFormat().resolvedOptions().timeZone;
+    }
+
+    // Add helper method for date validation
+    private validateDateWithDayOfWeek(date: Date, specifiedDay: string): boolean {
+        const daysOfWeek = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+        const dateDay = daysOfWeek[date.getDay()];
+        return dateDay === specifiedDay.toLowerCase();
+    }
+
+    private adjustDateToNextOccurrence(date: Date, specifiedDay: string): Date {
+        const daysOfWeek = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+        const targetDayIndex: number = daysOfWeek.indexOf(specifiedDay.toLowerCase());
+        const currentDayIndex: number = date.getDay();
+
+        let daysToAdd = targetDayIndex - currentDayIndex;
+        if (daysToAdd <= 0) daysToAdd += 7;
+
+        const newDate = new Date(date);
+        newDate.setDate(date.getDate() + daysToAdd);
+        return newDate;
+    }
+
+    private calculateDateConfidence(dateInfo: {
+        hasExplicitYear: boolean;
+        hasExplicitMonth: boolean;
+        hasExplicitDay: boolean;
+        hasNext: boolean;
+        specifiedDay: string | undefined;
+    }): number {
+        let confidence = 0.7; // Base confidence
+
+        // Add confidence for each explicit component
+        if (dateInfo.hasExplicitYear) confidence += 0.1;
+        if (dateInfo.hasExplicitMonth) confidence += 0.1;
+        if (dateInfo.hasExplicitDay) confidence += 0.1;
+
+        // Reduce confidence for relative terms
+        if (dateInfo.hasNext) confidence -= 0.1;
+
+        // Slight boost for day of week validation  
+        if (dateInfo.specifiedDay) confidence += 0.05;
+
+        // Full date specification gets maximum confidence
+        if (dateInfo.hasExplicitYear && dateInfo.hasExplicitMonth &&
+            dateInfo.hasExplicitDay && dateInfo.specifiedDay) {
+            confidence = 1.0;
+        }
+
+        return Math.min(Math.max(confidence, 0), 1);
     }
 }
 

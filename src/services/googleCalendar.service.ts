@@ -1,5 +1,6 @@
 import { google, calendar_v3 } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
+import { v4 as uuidv4 } from 'uuid';
 import { EnhancedParsedCommand, CalendarEvent, Context, Recurrence } from '../types/calendar.types';
 import fs from 'fs';
 import path from 'path';
@@ -22,6 +23,9 @@ class GoogleCalendarService {
         this.tokenPath = path.join(__dirname, '../../token.json');
         this.initializeOAuth();
     }
+
+
+
 
     // Main command handler
     async handleCommand(parsedCommand: EnhancedParsedCommand): Promise<{
@@ -209,13 +213,15 @@ class GoogleCalendarService {
         const baseEvent = existingEvent || {};
         const context = parsedCommand.context;
 
+        const timeZone = parsedCommand.timezone || this.timeZone;
+
         const eventResource: calendar_v3.Schema$Event = {
             ...baseEvent,
-            summary: parsedCommand.title || baseEvent.summary,
+            summary: this.toTitleCase(parsedCommand.title) || baseEvent.summary,
             description: this.buildDescription(parsedCommand),
             start: {
                 dateTime: parsedCommand.startTime?.toISOString() || baseEvent.start?.dateTime,
-                timeZone: this.timeZone,
+                timeZone: timeZone,
             },
             end: {
                 dateTime: endTime.toISOString(),
@@ -240,6 +246,28 @@ class GoogleCalendarService {
                 }
             }
         };
+
+        if (parsedCommand.videoLink) {
+            eventResource.conferenceData = {
+                createRequest: {
+                    requestId: uuidv4(),
+                    conferenceSolutionKey: {
+                        type: 'hangoutsMeet'
+                    },
+                    status: {
+                        statusCode: 'success'
+                    }
+                },
+                entryPoints: [
+                    {
+                        entryPointType: 'video',
+                        uri: parsedCommand.videoLink,
+                        label: 'Video call'
+                    }
+                ]
+            };
+        }
+
 
         return eventResource;
     }
@@ -596,9 +624,13 @@ class GoogleCalendarService {
             }
 
             this.oauth2Client.on('tokens', (tokens) => {
+                let existingTokens = {};
+                if (fs.existsSync(this.tokenPath)) {
+                    existingTokens = JSON.parse(fs.readFileSync(this.tokenPath, 'utf-8'));
+                }
                 if (tokens.refresh_token) {
                     this.saveTokens({
-                        ...JSON.parse(fs.readFileSync(this.tokenPath, 'utf-8')),
+                        ...existingTokens,
                         ...tokens
                     });
                 }
@@ -606,6 +638,19 @@ class GoogleCalendarService {
         } catch (error) {
             console.error('Error initializing OAuth:', error);
             this.isAuthenticated = false;
+        }
+    }
+
+    private async getAuthenticatedClient(): Promise<OAuth2Client> {
+        if (!this.isAuthenticated) {
+            throw new Error('Not authenticated with Google Calendar');
+        }
+
+        try {
+            return this.oauth2Client;
+        } catch (error) {
+            console.error('Error getting authenticated client:', error);
+            throw new Error('Failed to get authenticated client');
         }
     }
 
@@ -644,31 +689,68 @@ class GoogleCalendarService {
 
     private saveTokens(tokens: any) {
         try {
+            // Ensure the directory exists
+            const dir = path.dirname(this.tokenPath);
+            if (!fs.existsSync(dir)) {
+                fs.mkdirSync(dir, { recursive: true });
+            }
             fs.writeFileSync(this.tokenPath, JSON.stringify(tokens, null, 2));
             this.isAuthenticated = true;
+
+            // Initialize calendar after saving tokens
+            this.calendar = google.calendar({ version: 'v3', auth: this.oauth2Client });
+            this.timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
         } catch (error) {
             console.error('Error saving tokens:', error);
             this.isAuthenticated = false;
         }
     }
 
-    private async executeWithAuth<T>(operation: () => Promise<T>): Promise<T> {
-        if (!this.isAuthenticated) {
-            throw new Error('AUTH_REQUIRED');
-        }
 
-        try {
-            await this.refreshTokenIfNeeded();
-            return await operation();
-        } catch (error: any) {
-            if (error?.message === 'AUTH_REQUIRED' ||
-                error?.response?.data?.error === 'invalid_grant') {
-                this.isAuthenticated = false;
-                throw new Error('AUTH_REQUIRED');
-            }
-            throw error;
-        }
+    private async executeWithAuth<T>(operation: () => Promise<T>): Promise<T> {
+        await this.getAuthenticatedClient(); // This will throw if not authenticated
+        return operation();
     }
+
+    async getUserProfile() {
+        return this.executeWithAuth(async () => {
+            try {
+                console.log('Getting OAuth2 service...');
+                const service = google.oauth2('v2');
+
+                console.log('OAuth2 client state:', {
+                    credentials: this.oauth2Client.credentials,
+                });
+
+                console.log('Fetching user info...');
+                const userInfo = await service.userinfo.get({ auth: this.oauth2Client });
+
+                console.log('User info received:', userInfo.data);
+
+                return {
+                    name: userInfo.data.name || userInfo.data.email?.split('@')[0] || 'User',
+                    email: userInfo.data.email,
+                    id: userInfo.data.id
+                };
+            } catch (error: any) {
+                console.error('Detailed error fetching user profile:', {
+                    error: error,
+                    message: error.message,
+                    stack: error.stack,
+                    response: error.response?.data
+                });
+                return { name: 'User', email: null, id: null };
+            }
+        });
+    }
+
+    private toTitleCase(str: string): string {
+        return str
+          .toLowerCase()
+          .split(' ')
+          .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+          .join(' ');
+      }
 
     // Public auth methods
     public isUserAuthenticated(): boolean {
@@ -678,7 +760,9 @@ class GoogleCalendarService {
     async getAuthUrl(): Promise<string> {
         const scopes = [
             'https://www.googleapis.com/auth/calendar',
-            'https://www.googleapis.com/auth/calendar.events'
+            'https://www.googleapis.com/auth/calendar.events',
+            'https://www.googleapis.com/auth/userinfo.profile',
+            'https://www.googleapis.com/auth/userinfo.email'
         ];
 
         return this.oauth2Client.generateAuthUrl({

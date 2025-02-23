@@ -1,31 +1,42 @@
 import { Request, Response, NextFunction } from 'express';
 import { User } from '../models';
 import { IUser } from '../models/User';
-import { ClerkExpressRequireAuth } from '@clerk/clerk-sdk-node';
+import googleCalendarService from '../services/googleCalendar.service';
 
-type AuthenticatedRequest = Request & {
+interface AuthenticatedRequest extends Request {
     user?: IUser;
-    auth?: { userId: string };
 }
 
-export const authenticateUser = [
-    ClerkExpressRequireAuth(),
-    async (req: AuthenticatedRequest & { auth?: { userId: string } }, res: Response, next: NextFunction) => {
-        try {
-            const clerkUserId = req.auth?.userId;
-            if (!clerkUserId) {
-                return res.status(401).json({ error: 'Authentication required' });
-            }
 
-            const user = await User.findOne({ clerkId: clerkUserId });
-            if (!user) {
-                return res.status(401).json({ error: 'User not found' });
-            }
-
-            req.user = user;
-            next();
-        } catch (error) {
-            res.status(401).json({ error: 'Authentication failed' });
+export const authenticateUser = async (
+    req: AuthenticatedRequest,
+    res: Response,
+    next: NextFunction
+) => {
+    try {
+        // Get user profile from Google Calendar service
+        const profile = await googleCalendarService.getUserProfile();
+        
+        if (!profile.email) {
+            return res.status(401).json({ error: 'Authentication required' });
         }
+
+        // Find or create user
+        let user = await User.findOne({ email: profile.email });
+        
+        if (!user) {
+            user = await User.create({
+                email: profile.email,
+                googleId: profile.id, 
+            });
+        }
+
+        req.user = user;
+        req.user.id = user._id;
+        
+        next();
+    } catch (error) {
+        console.error('Auth middleware error:', error);
+        res.status(401).json({ error: 'Authentication failed' });
     }
-];
+};

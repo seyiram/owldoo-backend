@@ -18,11 +18,6 @@ const UserSchema = new Schema({
         required: true, 
         unique: true 
     },
-    clerkId: { 
-        type: String, 
-        required: true, 
-        unique: true 
-    },
     googleId: { 
         type: String, 
         required: true, 

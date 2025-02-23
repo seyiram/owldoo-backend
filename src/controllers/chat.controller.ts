@@ -1,17 +1,23 @@
-// src/controllers/thread.controller.ts
 import { Request, Response } from 'express';
 import Thread from '../models/Thread';
 import nlpService from '../services/nlp.service';
-import mongoose from 'mongoose';
+import { IUser } from '../models/User';
 
+interface AuthenticatedRequest extends Request {
+    user?: IUser;
+}
 
-const TEST_USER_ID = new mongoose.Types.ObjectId();
 
 // Create a new thread
-export const createThread = async (req: Request, res: Response) => {
+export const createThread = async (req: AuthenticatedRequest, res: Response) => {
     try {
         const { message } = req.body;
-        const userId = TEST_USER_ID; // Get from auth middleware
+       
+        if(!req.user) {
+            return res.status(401).json({ error: 'Authentication required' });
+        }
+
+        const userId = req.user.id;
 
         // Get response from NLP service
         const parsedCommand = await nlpService.parseCommand(message);
@@ -45,10 +51,14 @@ export const createThread = async (req: Request, res: Response) => {
 };
 
 // Add a message to a thread
-export const addMessage = async (req: Request, res: Response) => {
+export const addMessage = async (req: AuthenticatedRequest, res: Response) => {
     try {
         const { threadId, message } = req.body;
-        const userId = TEST_USER_ID;
+        if(!req.user) {
+            return res.status(401).json({ error: 'Authentication required' });
+        }
+
+        const userId = req.user.id;
 
         const thread = await Thread.findOne({ _id: threadId, userId });
         if (!thread) {
@@ -70,13 +80,13 @@ export const addMessage = async (req: Request, res: Response) => {
         // Add both user message and bot response
         thread.messages.push(
             {
-                id: TEST_USER_ID.toString(),
+                id: userId.toString(), 
                 sender: 'user',
                 content: message,
                 timestamp: new Date().toISOString(),
             },
             {
-                id: TEST_USER_ID.toString(),
+                id: userId.toString(),
                 sender: 'bot',
                 content: JSON.stringify(parsedCommand),
                 timestamp: new Date().toISOString(),
@@ -93,9 +103,14 @@ export const addMessage = async (req: Request, res: Response) => {
 };
 
 // Get all threads for a user
-export const getThreads = async (req: Request, res: Response) => {
+export const getThreads = async (req: AuthenticatedRequest, res: Response) => {
     try {
-        const userId = TEST_USER_ID;
+
+        if (!req.user) {
+            return res.status(401).json({ error: 'Authentication required' });
+        }
+
+        const userId = req.user.id;
         const threads = await Thread.find({ userId }).sort({ createdAt: -1 });
         res.json(threads);
     } catch (error) {
@@ -107,10 +122,15 @@ export const getThreads = async (req: Request, res: Response) => {
 };
 
 // Get a specific thread
-export const getThread = async (req: Request, res: Response) => {
+export const getThread = async (req: AuthenticatedRequest, res: Response) => {
     try {
+
+        if (!req.user) {
+            return res.status(401).json({ error: 'Authentication required' });
+        }
+
         const { threadId } = req.params;
-        const userId = TEST_USER_ID;
+        const userId = req.user.id;
 
         const thread = await Thread.findOne({ _id: threadId, userId });
         if (!thread) {

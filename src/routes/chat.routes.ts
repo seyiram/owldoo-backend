@@ -1,10 +1,12 @@
 
 import express from 'express';
 import * as chatController from '../controllers/chat.controller';
-import { authenticateUser as authMiddleware } from '../middleware/auth.middleware';
+import { authenticateUser } from '../middleware/auth.middleware';
 import { chat } from 'googleapis/build/src/apis/chat';
 
 const router = express.Router();
+
+router.use(authenticateUser);
 
 // Create a new chat thread
 router.post('/', chatController.createThread);

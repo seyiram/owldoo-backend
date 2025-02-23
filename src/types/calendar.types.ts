@@ -105,4 +105,12 @@ export interface EnhancedParsedCommand extends ParsedCommand {
     context?: Context;
     recurrence?: Recurrence;
     metadata?: Metadata;
+    timeConfidence: number;
+    timezone?: string;
+    validationDetails?: {
+        dayOfWeekMatch: boolean;
+        originalDay: string;
+        parsedDay: string;
+    };
+    videoLink?: string;
 }

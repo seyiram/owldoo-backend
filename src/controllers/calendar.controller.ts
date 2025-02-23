@@ -4,25 +4,46 @@ import googleCalendarService from '../services/googleCalendar.service';
 import { NLPLog, EventCache } from '../models';
 import { INLPLog } from '../models/NLPLog';
 import { EnhancedParsedCommand, CalendarEvent } from '../types/calendar.types';
+import { IUser } from '../models/User';
 import mongoose from 'mongoose';
+import { error } from 'console';
+
+interface AuthenticatedRequest extends Request {
+    user?: IUser;
+}
+
 
 class CalendarController {
-    private readonly TEST_USER_ID = new mongoose.Types.ObjectId('123456789012');
+
 
     /**
      * Main handler for processing calendar commands
      */
-    handleCommand = async (req: Request, res: Response) => {
+    handleCommand = async (req: AuthenticatedRequest, res: Response) => {
         try {
             const { command } = req.body;
-            const userId = this.TEST_USER_ID;
+            const userId = req.user?.id || req.user?._id;
+
+            console.log("Processing command for user: ", userId);
+
+            if (!userId) {
+                console.log('Auth debug:', { user: req.user, headers: req.headers });
+                return res.status(401).json({ error: 'User not authenticated' });
+            }
+
+
 
             // Create initial NLP log
-            let nlpLog = await this.createNLPLog(userId, command);
+            let nlpLog = await this.createNLPLog(new mongoose.Types.ObjectId(userId), command, false);
 
             try {
                 // Parse the command
-                const parsedCommand = await nlpService.parseCommand(command);
+                const parsedCommand = await nlpService.parseCommand(command, {
+                    previousMessages: req.body.previousMessages,
+                    threadId: req.body.threadId,
+                });
+
+                console.log("Parsed command: ", parsedCommand);
                 nlpLog.parsedCommand = parsedCommand;
                 nlpLog.metadata = parsedCommand.metadata;
                 await nlpLog.save();
@@ -81,7 +102,7 @@ class CalendarController {
 
             // Handle create/update/delete operations
             const result = await googleCalendarService.handleCommand(parsedCommand);
-            
+
             if (!result.success) {
                 return {
                     status: 409,
@@ -210,20 +231,20 @@ class CalendarController {
         const freq = parts.find(p => p.startsWith('FREQ='))?.split('=')[1];
         const interval = parts.find(p => p.startsWith('INTERVAL='))?.split('=')[1];
         const until = parts.find(p => p.startsWith('UNTIL='))?.split('=')[1];
-        
+
         let formatted = 'Recurring: ';
-        
+
         if (freq === 'DAILY') formatted += `Every${interval ? ` ${interval} ` : ' '}day`;
         else if (freq === 'WEEKLY') formatted += `Every${interval ? ` ${interval} ` : ' '}week`;
         else if (freq === 'MONTHLY') formatted += `Every${interval ? ` ${interval} ` : ' '}month`;
         else if (freq === 'YEARLY') formatted += `Every${interval ? ` ${interval} ` : ' '}year`;
         else return ruleWithoutPrefix;
-        
+
         if (until) {
             const untilDate = new Date(until.replace(/(\d{4})(\d{2})(\d{2}).*/, '$1-$2-$3'));
             formatted += ` until ${untilDate.toLocaleDateString()}`;
         }
-        
+
         return formatted;
     };
 
@@ -254,19 +275,19 @@ class CalendarController {
      */
     private cacheEvent = async (event: CalendarEvent, userId: mongoose.Types.ObjectId) => {
         try {
-            await EventCache.findOneAndUpdate(
-                {
-                    googleEventId: event.id,
-                    userId: userId.toString()
-                },
-                {
-                    $set: {
-                        eventData: event,
-                        lastSynced: new Date()
-                    }
-                },
-                { upsert: true, new: true }
-            );
+
+            if (!userId) {
+                throw new Error("User ID is required for caching event");
+            }
+
+            const cacheEntry = new EventCache({
+                userId: userId.toString(),
+                googleEventId: event.id,
+                eventData: event,
+                lastSynced: new Date()
+            });
+            await cacheEntry.save();
+            return cacheEntry;
         } catch (error) {
             console.error('Error caching event:', error);
             // Continue even if caching fails
@@ -299,10 +320,14 @@ class CalendarController {
     /**
      * Utility endpoint to get events
      */
-    getEvents = async (req: Request, res: Response) => {
+    getEvents = async (req: AuthenticatedRequest, res: Response) => {
         try {
             const { startDate, endDate } = req.query;
-            const userId = this.TEST_USER_ID;
+
+            if (!req.user) {
+                return res.status(401).json({ error: 'Authentication required' });
+            }
+            const userId = req.user.id;
 
             const events = await this.fetchAndCacheEvents(
                 userId,
@@ -360,9 +385,14 @@ class CalendarController {
     /**
      * Utility endpoint to get single event
      */
-    getEvent = async (req: Request, res: Response) => {
+    getEvent = async (req: AuthenticatedRequest, res: Response) => {
         try {
-            const event = await this.fetchAndCacheEvent(req.params.id, this.TEST_USER_ID);
+            if (!req.user) {
+                return res.status(401).json({ error: 'Authentication required' });
+            }
+
+            const userId = req.user.id;
+            const event = await this.fetchAndCacheEvent(req.params.id, userId);
             if (!event) {
                 return res.status(404).json({ error: 'Event not found' });
             }
@@ -420,6 +450,25 @@ class CalendarController {
         } catch (error) {
             return res.status(500).json({
                 error: error instanceof Error ? error.message : 'Failed to check auth status',
+                metadata: {
+                    timestamp: new Date().toISOString()
+                }
+            });
+        }
+    };
+
+    /**
+     * 
+     * Get user profile
+     */
+
+    getUserProfile = async (req: Request, res: Response) => {
+        try {
+            const profile = await googleCalendarService.getUserProfile();
+            return res.json(profile);
+        } catch (error) {
+            return res.status(500).json({
+                error: error instanceof Error ? error.message : 'Failed to fetch user profile',
                 metadata: {
                     timestamp: new Date().toISOString()
                 }
