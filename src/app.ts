@@ -15,6 +15,19 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Content Security Policy
+app.use((req, res, next) => {
+  res.header(
+    'Content-Security-Policy', 
+    "default-src 'self' https://accounts.google.com https://*.googleapis.com; " +
+    "frame-src https://accounts.google.com https://*.google.com; " +
+    "connect-src 'self' https://accounts.google.com https://*.googleapis.com; " +
+    "img-src 'self' https://*.googleusercontent.com data:; " +
+    "script-src 'self' 'unsafe-inline' https://accounts.google.com https://*.googleapis.com;"
+  );
+  next();
+});
+
 // Routes
 app.use('/api', router);
 

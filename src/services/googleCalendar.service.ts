@@ -227,7 +227,7 @@ class GoogleCalendarService {
                 dateTime: endTime.toISOString(),
                 timeZone: this.timeZone,
             },
-            location: parsedCommand.location || baseEvent.location,
+            location: parsedCommand.videoLink || parsedCommand.location || baseEvent.location,
             attendees: parsedCommand.attendees?.map(attendee => ({ email: attendee })) || baseEvent.attendees,
             // Handle recurrence
             recurrence: parsedCommand.recurrence ? this.buildRecurrenceRule(parsedCommand.recurrence) : undefined,
@@ -606,8 +606,31 @@ class GoogleCalendarService {
     // Auth methods
     private initializeOAuth() {
         try {
+            // Make sure the credentials file exists and has correct data
+            if (!fs.existsSync(this.credentialsPath)) {
+                console.error('Credentials file not found:', this.credentialsPath);
+                this.isAuthenticated = false;
+                return;
+            }
+
             const credentials = JSON.parse(fs.readFileSync(this.credentialsPath, 'utf-8'));
+
+            // Debug credentials content (remove sensitive data in production)
+            console.log("Credentials loaded:", {
+                hasClientId: !!credentials.web?.client_id,
+                hasClientSecret: !!credentials.web?.client_secret,
+                redirectUris: credentials.web?.redirect_uris
+            });
+
+            // Verify expected structure exists
+            if (!credentials.web || !credentials.web.client_id || !credentials.web.client_secret) {
+                console.error('Invalid credentials format');
+                this.isAuthenticated = false;
+                return;
+            }
+
             const { client_secret, client_id, redirect_uris } = credentials.web;
+            console.log("redirect_uris", redirect_uris);
 
             this.oauth2Client = new google.auth.OAuth2(
                 client_id,
@@ -616,14 +639,33 @@ class GoogleCalendarService {
             );
 
             if (fs.existsSync(this.tokenPath)) {
-                const tokens = JSON.parse(fs.readFileSync(this.tokenPath, 'utf-8'));
-                this.oauth2Client.setCredentials(tokens);
-                this.calendar = google.calendar({ version: 'v3', auth: this.oauth2Client });
-                this.timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-                this.isAuthenticated = true;
+                try {
+                    const tokens = JSON.parse(fs.readFileSync(this.tokenPath, 'utf-8'));
+
+                    // Check if token is expired
+                    if (tokens.expiry_date && tokens.expiry_date < Date.now()) {
+                        console.log("Token expired, clearing");
+                        this.clearTokens();
+                    } else {
+                        console.log("Setting credentials from stored tokens");
+                        this.oauth2Client.setCredentials(tokens);
+                        this.calendar = google.calendar({ version: 'v3', auth: this.oauth2Client });
+                        this.timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                        this.isAuthenticated = true;
+
+                        // Verify credentials work
+                        this.testCredentials();
+                    }
+                } catch (error) {
+                    console.error("Error loading tokens, clearing:", error);
+                    this.clearTokens();
+                }
+            } else {
+                console.log("No tokens found at path:", this.tokenPath);
             }
 
             this.oauth2Client.on('tokens', (tokens) => {
+                console.log("New tokens received from OAuth flow");
                 let existingTokens = {};
                 if (fs.existsSync(this.tokenPath)) {
                     existingTokens = JSON.parse(fs.readFileSync(this.tokenPath, 'utf-8'));
@@ -633,11 +675,39 @@ class GoogleCalendarService {
                         ...existingTokens,
                         ...tokens
                     });
+                } else {
+                    // Even if no refresh token, update the access token
+                    this.saveTokens({
+                        ...existingTokens,
+                        access_token: tokens.access_token,
+                        expiry_date: tokens.expiry_date
+                    });
                 }
             });
         } catch (error) {
             console.error('Error initializing OAuth:', error);
             this.isAuthenticated = false;
+        }
+    }
+
+    // Add a new method to test credentials
+    private async testCredentials() {
+        try {
+            console.log("Testing OAuth credentials...");
+            const service = google.oauth2('v2');
+            const userInfo = await service.userinfo.get({ auth: this.oauth2Client });
+            console.log("Credentials test successful. User:", userInfo.data.email);
+            return true;
+        } catch (error: any) {
+            console.error("Credentials test failed:", error);
+            // If it's an auth error, clear tokens
+            if (error.message &&
+                (error.message.includes('invalid_grant') ||
+                    error.message.includes('Invalid Credentials'))) {
+                console.log("Invalid credentials detected, clearing tokens");
+                this.clearTokens();
+            }
+            return false;
         }
     }
 
@@ -657,28 +727,49 @@ class GoogleCalendarService {
     private async refreshTokenIfNeeded(): Promise<void> {
         try {
             if (!fs.existsSync(this.tokenPath)) {
+                console.log("No token file found during refresh check");
                 throw new Error('AUTH_REQUIRED');
             }
-
+    
             const tokens = JSON.parse(fs.readFileSync(this.tokenPath, 'utf-8'));
-
+            
+            // Check if token is expired or will expire soon (within the next minute)
             if (!tokens.expiry_date || tokens.expiry_date < Date.now() + 60000) {
+                console.log("Token expired or expiring soon, refreshing...");
+                
+                if (!tokens.refresh_token) {
+                    console.log("No refresh token available, authentication required");
+                    throw new Error('AUTH_REQUIRED');
+                }
+                
+                // Make sure refresh token is set in OAuth client
+                this.oauth2Client.setCredentials({
+                    refresh_token: tokens.refresh_token
+                });
+                
                 const response = await this.oauth2Client.getAccessToken();
                 const newTokens = response.res?.data;
-
+    
                 if (newTokens) {
+                    console.log("Successfully refreshed access token");
                     this.saveTokens({
                         ...tokens,
-                        ...newTokens
+                        access_token: newTokens.access_token,
+                        expiry_date: newTokens.expiry_date || 
+                            (Date.now() + (newTokens.expires_in || 3600) * 1000)
                     });
-
+    
                     this.oauth2Client.setCredentials({
                         ...tokens,
                         ...newTokens
                     });
                 } else {
+                    console.log("Failed to get new tokens during refresh");
                     throw new Error('Failed to refresh token');
                 }
+            } else {
+                // Token still valid, nothing to do
+                // console.log("Token still valid, no refresh needed");
             }
         } catch (error) {
             console.error('Error refreshing token:', error);
@@ -694,12 +785,22 @@ class GoogleCalendarService {
             if (!fs.existsSync(dir)) {
                 fs.mkdirSync(dir, { recursive: true });
             }
+
+            // Log token info (without exposing actual tokens)
+            console.log("Saving tokens:", {
+                hasAccessToken: !!tokens.access_token,
+                hasRefreshToken: !!tokens.refresh_token,
+                expiryDate: tokens.expiry_date
+            });
+
             fs.writeFileSync(this.tokenPath, JSON.stringify(tokens, null, 2));
             this.isAuthenticated = true;
 
             // Initialize calendar after saving tokens
             this.calendar = google.calendar({ version: 'v3', auth: this.oauth2Client });
             this.timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+            console.log("Tokens saved successfully and calendar initialized");
         } catch (error) {
             console.error('Error saving tokens:', error);
             this.isAuthenticated = false;
@@ -708,8 +809,37 @@ class GoogleCalendarService {
 
 
     private async executeWithAuth<T>(operation: () => Promise<T>): Promise<T> {
-        await this.getAuthenticatedClient(); // This will throw if not authenticated
-        return operation();
+        try {
+            // First check if tokens exist
+            if (!this.oauth2Client.credentials || 
+                !this.oauth2Client.credentials.access_token) {
+                console.log("No credentials found in executeWithAuth");
+                throw new Error('AUTH_REQUIRED');
+            }
+            
+            // Try to refresh token if needed
+            await this.refreshTokenIfNeeded();
+            
+            // Execute the operation
+            return await operation();
+        } catch (error: any) {
+            if (error.message === 'AUTH_REQUIRED') {
+                // Propagate this specific error
+                throw error;
+            }
+            
+            // If we get auth errors during operation, try to handle them
+            if (error.message && 
+                (error.message.includes('invalid_grant') || 
+                 error.message.includes('Invalid Credentials'))) {
+                console.log("Auth error in executeWithAuth, clearing tokens");
+                this.clearTokens();
+                throw new Error('AUTH_REQUIRED');
+            }
+            
+            // Otherwise just rethrow
+            throw error;
+        }
     }
 
     async getUserProfile() {
@@ -719,7 +849,9 @@ class GoogleCalendarService {
                 const service = google.oauth2('v2');
 
                 console.log('OAuth2 client state:', {
-                    credentials: this.oauth2Client.credentials,
+                    hasAccessToken: !!this.oauth2Client.credentials.access_token,
+                    hasRefreshToken: !!this.oauth2Client.credentials.refresh_token,
+                    tokenExpiry: this.oauth2Client.credentials.expiry_date
                 });
 
                 console.log('Fetching user info...');
@@ -739,6 +871,15 @@ class GoogleCalendarService {
                     stack: error.stack,
                     response: error.response?.data
                 });
+
+                // If this is an auth error, clear tokens
+                if (error.message &&
+                    (error.message.includes('invalid_grant') ||
+                        error.message.includes('Invalid Credentials'))) {
+                    console.log("Invalid credentials detected, clearing tokens");
+                    this.clearTokens();
+                }
+
                 return { name: 'User', email: null, id: null };
             }
         });
@@ -746,15 +887,67 @@ class GoogleCalendarService {
 
     private toTitleCase(str: string): string {
         return str
-          .toLowerCase()
-          .split(' ')
-          .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-          .join(' ');
-      }
+            .toLowerCase()
+            .split(' ')
+            .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+            .join(' ');
+    }
 
     // Public auth methods
-    public isUserAuthenticated(): boolean {
-        return this.isAuthenticated;
+    async isUserAuthenticated() {
+        try {
+            console.log("Checking if user is authenticated");
+
+            // Check if we have tokens
+            if (!this.oauth2Client.credentials ||
+                !this.oauth2Client.credentials.access_token) {
+                console.log("No credentials or access token found");
+                return false;
+            }
+
+            console.log("Has access token, checking if it's valid");
+
+            // Try to get user profile as a test
+            try {
+                const userProfile = await this.getUserProfile();
+                console.log("Successfully retrieved user profile:", userProfile.email);
+                return true;
+            } catch (error: any) {
+                console.log('Auth check error:', error);
+
+                // If we get invalid_grant or token expired, clear the tokens
+                if (error.message &&
+                    (error.message.includes('invalid_grant') ||
+                        error.message.includes('Invalid Credentials') ||
+                        error.message.includes('token is expired'))) {
+                    console.log('Clearing invalid tokens');
+                    this.clearTokens();
+                    this.isAuthenticated = false;
+                    return false;
+                }
+                throw error;
+            }
+        } catch (error) {
+            console.log('Auth check general error:', error);
+            return false;
+        }
+    }
+
+    clearTokens() {
+        console.log("Clearing OAuth tokens");
+        this.oauth2Client.credentials = {};
+        
+        // Remove token file if it exists
+        if (fs.existsSync(this.tokenPath)) {
+            try {
+                fs.unlinkSync(this.tokenPath);
+                console.log("Token file removed");
+            } catch (err) {
+                console.error("Error removing token file:", err);
+            }
+        }
+        
+        this.isAuthenticated = false;
     }
 
     async getAuthUrl(): Promise<string> {
@@ -765,21 +958,43 @@ class GoogleCalendarService {
             'https://www.googleapis.com/auth/userinfo.email'
         ];
 
-        return this.oauth2Client.generateAuthUrl({
+        const authUrl = this.oauth2Client.generateAuthUrl({
             access_type: 'offline',
             scope: scopes,
-            prompt: 'consent'
+            prompt: 'consent',
+            include_granted_scopes: true
         });
+
+        console.log("Generated auth URL:", authUrl);
+        return authUrl;
     }
 
     async handleAuthCallback(code: string) {
         try {
+            console.log("Handling auth callback with code:", code.substring(0, 5) + '...');
+
             const { tokens } = await this.oauth2Client.getToken(code);
+            console.log("Tokens received:", {
+                hasAccessToken: !!tokens.access_token,
+                hasRefreshToken: !!tokens.refresh_token,
+                expiryDate: tokens.expiry_date
+            });
+
             this.oauth2Client.setCredentials(tokens);
             this.saveTokens(tokens);
             this.calendar = google.calendar({ version: 'v3', auth: this.oauth2Client });
             this.timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
             this.isAuthenticated = true;
+
+            // Test the auth immediately
+            try {
+                const service = google.oauth2('v2');
+                const userInfo = await service.userinfo.get({ auth: this.oauth2Client });
+                console.log("User info fetch successful after auth:", userInfo.data.email);
+            } catch (e) {
+                console.error("User info fetch failed after authentication:", e);
+            }
+
             return tokens;
         } catch (error) {
             console.error('Error handling auth callback:', error);

@@ -6,21 +6,24 @@ import { authenticateUser as authMiddleware } from '../middleware/auth.middlewar
 const router = express.Router();
 
 // All routes use auth middleware
-router.use(authMiddleware);
 
 // Auth routes
 router.get('/auth/url', authController.initiateGoogleAuth);
-router.get('/auth/callback', authController.handleGoogleCallback);
-router.get("/auth/status", authController.getAuthStatus);
-router.get('/profile', calendarController.getUserProfile);
 
 // Auth status check
 router.get('/auth/status', calendarController.checkAuthStatus);
 
+// User profile
+router.get('/profile', calendarController.getUserProfile);
+// router.get('/auth/callback', authController.handleGoogleCallback);
+
+router.use(authMiddleware);
+
+
 // Command endpoint
 router.post('/command', calendarController.handleCommand);
 
-// Utiity routes for direct API access
+// Events endpoints
 router.get('/events', calendarController.getEvents);
 router.get('/events/:id', calendarController.getEvent);
 
