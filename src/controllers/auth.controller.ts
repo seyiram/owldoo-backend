@@ -30,7 +30,7 @@ export const handleGoogleCallback = async (req: Request, res: Response) => {
         // Get the origin from the referer or a default value
         const origin = (req.headers.referer) ?
             new URL(req.headers.referer).origin :
-            'http://localhost:3000'; // Fallback to your frontend origin
+            'http://localhost:5173'; // Frontend application origin
 
         console.log('Using origin for postMessage:', origin);
 
@@ -70,7 +70,7 @@ export const handleGoogleCallback = async (req: Request, res: Response) => {
         // Get the origin from the referer or a default value
         const origin = (req.headers.referer) ?
             new URL(req.headers.referer).origin :
-            'http://localhost:3000'; // Fallback to your frontend origin
+            'http://localhost:5173'; // Frontend application origin
 
         res.send(`
             <html>
