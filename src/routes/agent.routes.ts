@@ -1,19 +1,24 @@
 import express from 'express';
-import * as agentController from '../controllers/agent.controller';
 import { authenticateUser } from '../middleware/auth.middleware';
+import * as agentController from '../controllers/agent.controller';
 
 const router = express.Router();
 
-// Apply authentication middleware to all agent routes
+// Apply authentication middleware to all routes
 router.use(authenticateUser);
 
-// Process a query through the agent
-router.post('/query', agentController.processQuery);
-
-// Queue a task for asynchronous processing
+// Agent task routes
 router.post('/tasks', agentController.queueTask);
+router.get('/tasks', agentController.getTasks);
 
-// Get personalized suggestions based on calendar data and user history
+// Suggestion routes
 router.get('/suggestions', agentController.getSuggestions);
+router.post('/suggestions/:suggestionId', agentController.updateSuggestion);
+
+// Insight routes
+router.get('/insights', agentController.getInsights);
+
+// Stats route
+router.get('/stats', agentController.getStats);
 
 export default router;

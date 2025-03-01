@@ -1,8 +1,10 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { MessageParam } from '@anthropic-ai/sdk/resources';
+import mongoose from 'mongoose';
 import { ParsedCommand, ParseCommandOptions, TimeDefaults, EnhancedParsedCommand, Context, Recurrence, CalendarEvent } from '../types/calendar.types';
 import GoogleCalendarService from './googleCalendar.service';
 import { UserPreferences } from '../models';
+import { contextService } from './context.service';
 
 
 
@@ -167,83 +169,106 @@ class NLPService {
         return initialParse;
     }
 
-    private async parseWithAnthropic(input: string, context?: { previousMessages?: any[], threadId?: string, userId?: string }): Promise<EnhancedParsedCommand> {
-        const userTimezone = await this.getUserTimezone(context?.userId);
-        const currentTime = new Date();
+    private async parseWithAnthropic(input: string, options?: ParseCommandOptions): Promise<EnhancedParsedCommand> {
+        try {
+            // Get user context if userId is provided
+            let userContext = null;
+            if (options?.userId) {
+                userContext = await contextService.getUserContext(options.userId);
+            }
 
+            const userTimezone = await this.getUserTimezone(options?.userId);
+            const currentTime = new Date();
 
-        //  debug logging
-        console.log('User Timezone:', userTimezone);
-        console.log('Current Time:', currentTime.toLocaleString());
+            // Build conversation context from previous messages
+            let conversationContext = '';
+            if (options?.previousMessages?.length) {
+                conversationContext = options.previousMessages
+                    .slice(-5) // Use last 5 messages for context
+                    .map(msg => `${msg.role}: ${msg.content}`)
+                    .join('\n');
+            }
 
-        const conversationContext = context?.previousMessages?.map((msg => `${msg.role}: ${msg.content}`)).join('\n') || '';
+            // Handle update commands (move/reschedule)
+            if (input.toLowerCase().includes('change') || input.toLowerCase().includes('move') || input.toLowerCase().includes('reschedule')) {
+                // Find the most recent create command in the context
+                const previousCreate = options?.previousMessages?.reverse().find(msg =>
+                    msg.role === 'user' && (msg.content.toLowerCase().includes('create') || msg.content.toLowerCase().includes('schedule'))
+                );
 
-        if (input.toLowerCase().includes('change') || input.toLowerCase().includes('move') || input.toLowerCase().includes('reschedule')) {
-            // Find the most recent create command in the context
-            const previousCreate = context?.previousMessages?.reverse().find(msg => msg.role === 'user' && (msg.content.toLowerCase().includes('create') || msg.content.toLowerCase().includes('schedule')));
+                if (previousCreate) {
+                    // Extract the time pattern from the original command
+                    const timePattern = previousCreate.content.match(/(\d{1,2})(?::\d{2})?\s*(?:am|pm)\s*to\s*(\d{1,2})(?::\d{2})?\s*(?:am|pm)/i);
+                    if (timePattern) {
+                        // Preserve the original time range when updating the date
+                        const [, startTime, endTime] = timePattern;
+                        input = `${input} at ${startTime}${endTime ? ` to ${endTime}` : ''}`;
+                    }
 
-            if (previousCreate) {
-                // Extract the time pattern from the original command
-                const timePattern = previousCreate.content.match(/(\d{1,2})(?::\d{2})?\s*(?:am|pm)\s*to\s*(\d{1,2})(?::\d{2})?\s*(?:am|pm)/i);
-                if (timePattern) {
-                    // Preserve the original time range when updating the date
-                    const [, startTime, endTime] = timePattern;
-                    input = `${input} at ${startTime}${endTime ? ` to ${endTime}` : ''}`;
-                }
-
-                // Extract the event title from the original command
-                const titleMatch = previousCreate.content.match(/schedule\s+(.+?)\s+for/i);
-                if (titleMatch) {
-                    const originalTitle = titleMatch[1];
-                    if (!input.includes(originalTitle)) {
-                        input = `${input} for "${originalTitle}"`;
+                    // Extract the event title from the original command
+                    const titleMatch = previousCreate.content.match(/schedule\s+(.+?)\s+for/i);
+                    if (titleMatch) {
+                        const originalTitle = titleMatch[1];
+                        if (!input.includes(originalTitle)) {
+                            input = `${input} for "${originalTitle}"`;
+                        }
                     }
                 }
             }
-        }
 
-
-        const messages: MessageParam[] = [
-            {
-                role: "assistant",
-                content: [
-                    {
-                        type: 'text',
-                        text: `You are a calendar event parser specialized in understanding natural language and handling edge cases.
+            // Create enhanced system prompt with context
+            const systemPrompt = `Parse calendar commands and return structured JSON. Handle time ranges crossing midnight correctly. Ensure all times are in ISO format with timezone. For ranges like "3pm to 1:30am", calculate the full duration including the next day.
     
     CURRENT CONTEXT:
     Time: ${currentTime.toISOString()}
     Timezone: ${userTimezone}
     Day: ${currentTime.toLocaleDateString('en-US', { weekday: 'long' })}
-
+    
+    ${userContext ? `USER CONTEXT:
+    Working hours: ${userContext.preferences.workingHours?.start || '09:00'} to ${userContext.preferences.workingHours?.end || '17:00'}
+    Default meeting duration: ${userContext.preferences.defaultMeetingDuration || 30} minutes
+    Time of day: ${userContext.timeAwareness.timeOfDay}
+    Is weekend: ${userContext.timeAwareness.isWeekend}
+    Is working hour: ${userContext.timeAwareness.isWorkingHour}
+    Upcoming events: ${userContext.upcomingEvents.map(e => e.summary).join(', ') || 'None'}
+    Common contacts: ${userContext.behavioralPatterns.frequentContacts.join(', ') || 'None'}` : ''}
+    
     PREVIOUS CONVERSATION:
-    ${conversationContext}
-    
+    ${conversationContext}`;
+
+            const messages: MessageParam[] = [
+                {
+                    role: "assistant",
+                    content: [
+                        {
+                            type: 'text',
+                            text: `You are a calendar event parser specialized in understanding natural language and handling edge cases.
+        
     COMMAND INTERPRETATION GUIDELINES:
-
-Key requirements:
-- Parse specific dates like "Tuesday 25th February" into exact ISO dates with the correct year
-- Validate that parsed dates match specified days of the week
-- Handle time specifications in 12-hour format (e.g., "12pm")
-- Default to next occurrence if date is in the future
-- Return all times in ISO format with timezone
-- Include confidence scores (0-1) for date/time parsing accuracy
-
-Example input: "schedule an interview with Jay Jaffar from Fortive for Tuesday 25th February at 12pm"
-Example output: {
-    "action": "create",
-    "title": "Interview with Jay Jaffar from Fortive",
-    "startTime": "2025-02-25T12:00:00.000Z",
-    "duration": 30,
-    "confidence": 0.95,
-    "context": {
-        "isUrgent": false,
-        "isFlexible": false,
-        "priority": "normal",
-        "timePreference": "exact"
-    }
-}
     
+    Key requirements:
+    - Parse specific dates like "Tuesday 25th February" into exact ISO dates with the correct year
+    - Validate that parsed dates match specified days of the week
+    - Handle time specifications in 12-hour format (e.g., "12pm")
+    - Default to next occurrence if date is in the future
+    - Return all times in ISO format with timezone
+    - Include confidence scores (0-1) for date/time parsing accuracy
+    
+    Example input: "schedule an interview with Jay Jaffar from Fortive for Tuesday 25th February at 12pm"
+    Example output: {
+        "action": "create",
+        "title": "Interview with Jay Jaffar from Fortive",
+        "startTime": "2025-02-25T12:00:00.000Z",
+        "duration": 30,
+        "confidence": 0.95,
+        "context": {
+            "isUrgent": false,
+            "isFlexible": false,
+            "priority": "normal",
+            "timePreference": "exact"
+        }
+    }
+        
     1. Action Classification:
        CREATE:
          Primary: "schedule", "set up", "add", "create", "book", "plan"
@@ -344,141 +369,145 @@ Example output: {
             "missingInformation": string[]
         }
     }`
-                    },
-                ],
-            },
-            {
-                role: "user",
-                content: [
-                    {
-                        type: 'text',
-                        text: input,
-                    },
-                ],
-            },
-        ];
+                        },
+                    ],
+                },
+                {
+                    role: "user",
+                    content: [
+                        {
+                            type: 'text',
+                            text: input,
+                        },
+                    ],
+                },
+            ];
 
-        const response = await this.client.messages.create({
-            model: "claude-3-sonnet-20240229",
-            max_tokens: 1024,
-            messages,
-            temperature: 0,
-            system: `Parse calendar commands and return structured JSON. Handle time ranges crossing midnight correctly. Ensure all times are in ISO format with timezone. For ranges like "3pm to 1:30am", calculate the full duration including the next day.`,
-        });
+            const response = await this.client.messages.create({
+                model: "claude-3-sonnet-20240229",
+                max_tokens: 1024,
+                messages,
+                temperature: 0,
+                system: systemPrompt,
+            });
 
-        if (!response.content || response.content.length === 0) {
-            throw new Error('No response from Claude');
-        }
-
-        let text = '';
-        for (const block of response.content) {
-            if (block.type === 'text') {
-                text += block.text;
+            if (!response.content || response.content.length === 0) {
+                throw new Error('No response from Claude');
             }
-        }
 
-        if (!text) {
-            throw new Error('No text content found in response');
-        }
+            let text = '';
+            for (const block of response.content) {
+                if (block.type === 'text') {
+                    text += block.text;
+                }
+            }
 
-        try {
-            const parsedResponse = JSON.parse(text);
+            if (!text) {
+                throw new Error('No text content found in response');
+            }
 
-            console.log('Parsed Response:', parsedResponse);
+            try {
+                const parsedResponse = JSON.parse(text);
 
-            // Validate the parsed date matches the day of week
-            if (parsedResponse.startTime) {
-                const date = new Date(parsedResponse.startTime);
+                console.log('Parsed Response:', parsedResponse);
 
-                // Extract date components from input
-                const dateInfo = {
-                    hasExplicitYear: !!input.match(/\b\d{4}\b/),
-                    hasExplicitMonth: !!input.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/i),
-                    hasExplicitDay: !!input.match(/\b(\d{1,2})(st|nd|rd|th)?\b/),
-                    hasNext: !!input.match(/\b(next|coming)\b/i),
-                    specifiedDay: input.match(/(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i)?.[1]
+                // Validate the parsed date matches the day of week
+                if (parsedResponse.startTime) {
+                    const date = new Date(parsedResponse.startTime);
+
+                    // Extract date components from input
+                    const dateInfo = {
+                        hasExplicitYear: !!input.match(/\b\d{4}\b/),
+                        hasExplicitMonth: !!input.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/i),
+                        hasExplicitDay: !!input.match(/\b(\d{1,2})(st|nd|rd|th)?\b/),
+                        hasNext: !!input.match(/\b(next|coming)\b/i),
+                        specifiedDay: input.match(/(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i)?.[1]
+                    };
+
+                    console.log('Date parsing info:', dateInfo);
+
+                    // Validate day of week if specified
+                    if (dateInfo.specifiedDay) {
+                        const actualDay = date.toLocaleDateString('en-US', { weekday: 'long' });
+                        if (!this.validateDateWithDayOfWeek(date, dateInfo.specifiedDay)) {
+                            console.warn(`Day mismatch: specified ${dateInfo.specifiedDay}, but date falls on ${actualDay}`);
+                            throw new Error(`The specified date (${date.toDateString()}) falls on ${actualDay}, not ${dateInfo.specifiedDay}`);
+                        }
+                    }
+
+                    // Determine if we should adjust the date
+                    const shouldAdjustDate = !dateInfo.hasExplicitYear ||
+                        (dateInfo.hasNext && !dateInfo.hasExplicitMonth) ||
+                        (!dateInfo.hasExplicitMonth && !dateInfo.hasExplicitDay);
+
+                    if (shouldAdjustDate && dateInfo.specifiedDay) {
+                        console.log('Adjusting date to next occurrence');
+                        parsedResponse.startTime = this.adjustDateToNextOccurrence(date, dateInfo.specifiedDay);
+                    }
+
+                    // Validate the final date is not in the past
+                    const now = new Date();
+                    if (parsedResponse.startTime < now) {
+                        console.warn('Adjusted date is in the past, moving to next year');
+                        parsedResponse.startTime.setFullYear(parsedResponse.startTime.getFullYear() + 1);
+                    }
+
+                    // Add confidence adjustments based on date specificity
+                    parsedResponse.confidence = this.calculateDateConfidence(dateInfo);
+                }
+
+                // Validate required fields
+                if (!parsedResponse.action || !parsedResponse.title || !parsedResponse.startTime || !parsedResponse.duration) {
+                    throw new Error('Missing required fields in parsed response');
+                }
+
+                // Convert string dates to Date objects before creating enhancedResponse
+                if (typeof parsedResponse.startTime === 'string') {
+                    parsedResponse.startTime = new Date(parsedResponse.startTime);
+                }
+                if (typeof parsedResponse.targetTime === 'string') {
+                    parsedResponse.targetTime = new Date(parsedResponse.targetTime);
+                }
+                if (parsedResponse.recurrence?.until && typeof parsedResponse.recurrence.until === 'string') {
+                    parsedResponse.recurrence.until = new Date(parsedResponse.recurrence.until);
+                }
+
+                // Add metadata
+                const enhancedResponse: EnhancedParsedCommand = {
+                    ...parsedResponse,
+                    metadata: {
+                        originalText: input,
+                        parseTime: new Date(),
+                        parserVersion: this.VERSION,
+                        confidence: parsedResponse.confidence || 0,
+                        context: options
+                    }
                 };
 
-                console.log('Date parsing info:', dateInfo);
-
-                // Validate day of week if specified
-                if (dateInfo.specifiedDay) {
-                    const actualDay = date.toLocaleDateString('en-US', { weekday: 'long' });
-                    if (!this.validateDateWithDayOfWeek(date, dateInfo.specifiedDay)) {
-                        console.warn(`Day mismatch: specified ${dateInfo.specifiedDay}, but date falls on ${actualDay}`);
-                        throw new Error(`The specified date (${date.toDateString()}) falls on ${actualDay}, not ${dateInfo.specifiedDay}`);
-                    }
+                // Convert string dates to Date objects and handle timezones
+                if (enhancedResponse.startTime) {
+                    enhancedResponse.startTime = this.convertToLocalTime(enhancedResponse.startTime.toISOString(), userTimezone);
+                }
+                if (enhancedResponse.targetTime) {
+                    enhancedResponse.targetTime = this.convertToLocalTime(enhancedResponse.targetTime.toISOString(), userTimezone);
+                }
+                if (enhancedResponse.recurrence?.until) {
+                    enhancedResponse.recurrence.until = this.convertToLocalTime(enhancedResponse.recurrence.until.toISOString(), userTimezone);
                 }
 
-                // Determine if we should adjust the date
-                const shouldAdjustDate = !dateInfo.hasExplicitYear ||
-                    (dateInfo.hasNext && !dateInfo.hasExplicitMonth) ||
-                    (!dateInfo.hasExplicitMonth && !dateInfo.hasExplicitDay);
-
-                if (shouldAdjustDate && dateInfo.specifiedDay) {
-                    console.log('Adjusting date to next occurrence');
-                    parsedResponse.startTime = this.adjustDateToNextOccurrence(date, dateInfo.specifiedDay);
+                // Validate the enhanced response structure
+                if (!this.validateEnhancedParsedCommand(enhancedResponse)) {
+                    throw new Error('Invalid parsed command structure');
                 }
 
-                // Validate the final date is not in the past
-                const now = new Date();
-                if (parsedResponse.startTime < now) {
-                    console.warn('Adjusted date is in the past, moving to next year');
-                    parsedResponse.startTime.setFullYear(parsedResponse.startTime.getFullYear() + 1);
-                }
-
-                // Add confidence adjustments based on date specificity
-                parsedResponse.confidence = this.calculateDateConfidence(dateInfo);
-            }
-
-            // Validate required fields
-            if (!parsedResponse.action || !parsedResponse.title || !parsedResponse.startTime || !parsedResponse.duration) {
-                throw new Error('Missing required fields in parsed response');
-            }
-
-            // Convert string dates to Date objects before creating enhancedResponse
-            if (typeof parsedResponse.startTime === 'string') {
-                parsedResponse.startTime = new Date(parsedResponse.startTime);
-            }
-            if (typeof parsedResponse.targetTime === 'string') {
-                parsedResponse.targetTime = new Date(parsedResponse.targetTime);
-            }
-            if (parsedResponse.recurrence?.until && typeof parsedResponse.recurrence.until === 'string') {
-                parsedResponse.recurrence.until = new Date(parsedResponse.recurrence.until);
-            }
-
-
-            // Add metadata
-            const enhancedResponse: EnhancedParsedCommand = {
-                ...parsedResponse,
-                metadata: {
-                    originalText: input,
-                    parseTime: new Date(),
-                    parserVersion: this.VERSION,
-                    confidence: parsedResponse.confidence || 0
-                }
-            };
-
-            // Convert string dates to Date objects and handle timezones
-            if (enhancedResponse.startTime) {
-                enhancedResponse.startTime = this.convertToLocalTime(enhancedResponse.startTime.toISOString(), userTimezone);
-            }
-            if (enhancedResponse.targetTime) {
-                enhancedResponse.targetTime = this.convertToLocalTime(enhancedResponse.targetTime.toISOString(), userTimezone);
-            }
-            if (enhancedResponse.recurrence?.until) {
-                enhancedResponse.recurrence.until = this.convertToLocalTime(enhancedResponse.recurrence.until.toISOString(), userTimezone);
-            }
-
-            // Validate the enhanced response structure
-            if (!this.validateEnhancedParsedCommand(enhancedResponse)) {
+                return enhancedResponse;
+            } catch (error) {
+                console.error('Error parsing Anthropic response:', error);
                 throw new Error('Invalid parsed command structure');
             }
-
-            return enhancedResponse;
         } catch (error) {
-            console.error('Error parsing Anthropic response:', error);
-            throw new Error('Invalid parsed command structure');
+            console.error('Error in parseWithAnthropic:', error);
+            throw error;
         }
     }
 
@@ -1266,6 +1295,177 @@ Example output: {
         }
 
         return Math.min(Math.max(confidence, 0), 1);
+    }
+
+    // Add to NLPService class
+
+    async generateContextualResponse(input: string, options?: ParseCommandOptions): Promise<string> {
+        try {
+            // Get user context
+            const userId = options?.userId;
+            const userContext = userId ? await this.buildUserContext(userId) : null;
+
+            // Build context-aware prompt
+            const currentTime = new Date();
+            const userTimezone = await this.getUserTimezone(userId);
+
+            // Get conversation context
+            let conversationContext = '';
+            if (options?.previousMessages && options.previousMessages.length > 0) {
+                conversationContext = options.previousMessages
+                    .slice(-5) // Use last 5 messages for context
+                    .map(msg => `${msg.role}: ${msg.content}`)
+                    .join('\n');
+            }
+
+            // Create enhanced system prompt with context
+            const systemPrompt = `You are an intelligent assistant with the following context:
+      
+  CURRENT CONTEXT:
+  Time: ${currentTime.toISOString()}
+  Timezone: ${userTimezone}
+  Day: ${currentTime.toLocaleDateString('en-US', { weekday: 'long' })}
+  
+  ${userContext ? `USER CONTEXT:
+  Working hours: ${userContext.workingHours?.start || 'Unknown'} to ${userContext.workingHours?.end || 'Unknown'}
+  Preferred meeting duration: ${userContext.defaultMeetingDuration || 30} minutes
+  Recent calendar events: ${userContext.recentEvents?.map((event: { title: string }) => event.title).join(', ') || 'None'}` : ''}
+  
+  PREVIOUS CONVERSATION:
+  ${conversationContext}
+  
+  Respond in a helpful, concise manner. For calendar operations, extract specific details about dates, times, and event information.`;
+
+            // Generate response with Claude
+            const response = await this.client.messages.create({
+                model: "claude-3-sonnet-20240229",
+                max_tokens: 1024,
+                system: systemPrompt,
+                messages: [
+                    {
+                        role: "user",
+                        content: input
+                    }
+                ]
+            });
+
+            return response.content[0].type === 'text'
+                ? response.content[0].text
+                : 'Unable to process response';
+        } catch (error) {
+            console.error('Error generating contextual response:', error);
+            return `I'm sorry, I encountered an error while processing your request. ${error instanceof Error ? error.message : ''}`;
+        }
+    }
+
+    private async buildUserContext(userId: string): Promise<any> {
+        try {
+            // Get user preferences
+            const user = await mongoose.model('User').findById(userId);
+
+            // Get recent calendar events
+            const now = new Date();
+            const pastDate = new Date(now);
+            pastDate.setDate(now.getDate() - 7);
+            const futureDate = new Date(now);
+            futureDate.setDate(now.getDate() + 7);
+
+            const recentEvents = await mongoose.model('Event').find({
+                userId,
+                startTime: { $gte: pastDate, $lte: futureDate }
+            }).sort({ startTime: 1 }).limit(5);
+
+            return {
+                workingHours: user?.preferences?.workingHours,
+                defaultMeetingDuration: user?.preferences?.defaultMeetingDuration || 30,
+                recentEvents: recentEvents.map(event => ({
+                    title: event.title,
+                    startTime: event.startTime,
+                    endTime: event.endTime
+                }))
+            };
+        } catch (error) {
+            console.error('Error building user context:', error);
+            return null;
+        }
+    }
+
+    /**
+     * 
+     *StreamResponse method for streaming response from Claude
+     */
+
+    async streamResponse(input: string, options?: ParseCommandOptions): Promise<AsyncIterable<string>> {
+        try {
+            // Get user context
+            const userId = options?.userId;
+            const userContext = userId ? await this.buildUserContext(userId) : null;
+
+            // Build context-aware prompt
+            const currentTime = new Date();
+            const userTimezone = await this.getUserTimezone(userId);
+
+            // Get conversation context
+            let conversationContext = '';
+            if (options?.previousMessages && options.previousMessages.length > 0) {
+                conversationContext = options.previousMessages
+                    .slice(-5) // Use last 5 messages for context
+                    .map(msg => `${msg.role}: ${msg.content}`)
+                    .join('\n');
+            }
+
+            // Create enhanced system prompt with context
+            const systemPrompt = `You are an intelligent assistant with the following context:
+      
+  CURRENT CONTEXT:
+  Time: ${currentTime.toISOString()}
+  Timezone: ${userTimezone}
+  Day: ${currentTime.toLocaleDateString('en-US', { weekday: 'long' })}
+  
+  ${userContext ? `USER CONTEXT:
+  Working hours: ${userContext.workingHours?.start || 'Unknown'} to ${userContext.workingHours?.end || 'Unknown'}
+  Preferred meeting duration: ${userContext.defaultMeetingDuration || 30} minutes
+  Recent calendar events: ${userContext.recentEvents?.map((e: { title: string }) => e.title).join(', ') || 'None'}` : ''}
+  
+  PREVIOUS CONVERSATION:
+  ${conversationContext}
+  
+  Respond in a helpful, concise manner. For calendar operations, extract specific details about dates, times, and event information.`;
+
+            // Stream response with Claude
+            const stream = await this.client.messages.create({
+                model: "claude-3-sonnet-20240229",
+                max_tokens: 1024,
+                stream: true,
+                system: systemPrompt,
+                messages: [
+                    {
+                        role: "user",
+                        content: input
+                    }
+                ]
+            });
+
+            // Return the stream for controller to handle
+            return {
+                [Symbol.asyncIterator]: async function* () {
+                    for await (const chunk of stream) {
+                        if (chunk.type === 'content_block_delta' &&
+                            'text' in chunk.delta &&
+                            chunk.delta.text) {
+                            yield chunk.delta.text;
+                        }
+                    }
+                }
+            };
+        } catch (error) {
+            console.error('Error streaming response:', error);
+            return {
+                [Symbol.asyncIterator]: async function* () {
+                    yield `I'm sorry, I encountered an error while processing your request. ${error instanceof Error ? error.message : ''}`;
+                }
+            };
+        }
     }
 }
 

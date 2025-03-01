@@ -7,7 +7,6 @@ interface AuthenticatedRequest extends Request {
     user?: IUser;
 }
 
-
 export const authenticateUser = async (
     req: AuthenticatedRequest,
     res: Response,

@@ -7,7 +7,6 @@ interface AuthenticatedRequest extends Request {
     user?: IUser;
 }
 
-
 // Create a new thread
 export const createThread = async (req: AuthenticatedRequest, res: Response) => {
     try {
@@ -141,6 +140,48 @@ export const getThread = async (req: AuthenticatedRequest, res: Response) => {
     } catch (error) {
         res.status(500).json({
             error: error instanceof Error ? error.message : 'Failed to fetch thread'
+        });
+    }
+};
+
+// Stream responses from the bot
+export const streamResponse = async (req: AuthenticatedRequest, res: Response) => {
+    try {
+        if (!req.user) {
+            return res.status(401).json({ error: 'Authentication required' });
+        }
+
+        const { threadId } = req.params;
+        const userId = req.user.id;
+
+        const thread = await Thread.findOne({ _id: threadId, userId });
+        if (!thread) {
+            return res.status(404).json({ error: 'Thread not found' });
+        }
+
+        // Use the streamResponse method from nlpService
+        const responseStream = await nlpService.streamResponse('Your input here', {
+            userId,
+            previousMessages: thread.messages.map(msg => ({
+                role: msg.sender,
+                content: msg.content
+            }))
+        });
+
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive'
+        });
+
+        for await (const chunk of responseStream) {
+            res.write(`data: ${chunk}\n\n`);
+        }
+
+        res.end();
+    } catch (error) {
+        res.status(500).json({
+            error: error instanceof Error ? error.message : 'Failed to stream response'
         });
     }
 };

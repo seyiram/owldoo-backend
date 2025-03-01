@@ -14,6 +14,7 @@ export interface ParsedCommand {
 export interface ParseCommandOptions {
     previousMessages?: Array<{ role: string; content: string }>;
     threadId?: string;
+    userId?: string;
 }
 
 
@@ -32,6 +33,7 @@ export interface CalendarEvent {
     attendees?: { email: string }[];
     recurrence?: string[];
     conferenceData?: any;
+    recurringEventId?: string;
 }
 
 // export interface CalendarEvent {
@@ -90,6 +92,11 @@ export interface Metadata {
     parseTime: Date;
     parserVersion: string;
     confidence: number;
+    context?: {
+        previousMessages?: any[];
+        threadId?: string;
+        userId?: string;
+    };
 }
 
 export interface EnhancedAmbiguityResolution extends AmbiguityResolution {
