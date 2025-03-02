@@ -19,13 +19,103 @@ class GoogleCalendarService {
     private readonly credentialsPath: string;
 
     constructor() {
-        this.credentialsPath = path.join(__dirname, '../config/client_secret_743979723001-ba6houcjh052sqjk8e2mumb7jffkdc3f.apps.googleusercontent.com.json');
-        this.tokenPath = path.join(__dirname, '../../token.json');
+        // Update paths to be more flexible
+        const rootDir = path.resolve(__dirname, '../../');
+        this.credentialsPath = path.join(rootDir, 'config/credentials.json');
+        this.tokenPath = path.join(rootDir, 'tokens/token.json');
+        
+        // Debug log the resolved paths and file existence
+        console.log('Path resolution:', {
+            __dirname,
+            rootDir,
+            credentialsPath: this.credentialsPath,
+            tokenPath: this.tokenPath,
+            credentialsExists: fs.existsSync(this.credentialsPath),
+            credentialsDirExists: fs.existsSync(path.dirname(this.credentialsPath))
+        });
+
+        // List contents of the config directory
+        const configDir = path.dirname(this.credentialsPath);
+        if (fs.existsSync(configDir)) {
+            console.log('Config directory contents:', fs.readdirSync(configDir));
+        } else {
+            console.log('Config directory does not exist');
+            fs.mkdirSync(configDir, { recursive: true });
+        }
+
+        // Ensure tokens directory exists
+        const tokenDir = path.dirname(this.tokenPath);
+        if (!fs.existsSync(tokenDir)) {
+            fs.mkdirSync(tokenDir, { recursive: true });
+        }
+
         this.initializeOAuth();
     }
 
+    private initializeOAuth() {
+        try {
+            console.log('Current working directory:', process.cwd());
+            console.log('Attempting to read credentials from:', this.credentialsPath);
+            
+            // Check if credentials file exists and is accessible
+            try {
+                fs.accessSync(this.credentialsPath, fs.constants.R_OK);
+            } catch (error) {
+                console.error('Credentials file access error:', error);
+                console.log('File stats:', fs.statSync(this.credentialsPath));
+                throw new Error(`Cannot read credentials file. Please check permissions at ${this.credentialsPath}`);
+            }
 
+            // Check if credentials file exists
+            if (!fs.existsSync(this.credentialsPath)) {
+                console.error('Credentials file not found:', this.credentialsPath);
+                throw new Error(`Google Calendar credentials file not found at ${this.credentialsPath}`);
+            }
 
+            // Log the credentials content (remove in production)
+            const credentials = JSON.parse(fs.readFileSync(this.credentialsPath, 'utf-8'));
+            console.log('Loaded credentials:', {
+                hasClientId: !!credentials.web?.client_id,
+                hasClientSecret: !!credentials.web?.client_secret,
+                redirectUris: credentials.web?.redirect_uris
+            });
+
+            // Initialize OAuth client
+            const { client_secret, client_id, redirect_uris } = credentials.web;
+            this.oauth2Client = new google.auth.OAuth2(
+                client_id,
+                client_secret,
+                redirect_uris[0]
+            );
+
+            // Try to load existing tokens if they exist
+            if (fs.existsSync(this.tokenPath)) {
+                try {
+                    const tokens = JSON.parse(fs.readFileSync(this.tokenPath, 'utf-8'));
+                    console.log('Found existing tokens:', {
+                        hasAccessToken: !!tokens.access_token,
+                        hasRefreshToken: !!tokens.refresh_token,
+                        expiryDate: tokens.expiry_date
+                    });
+                    this.oauth2Client.setCredentials(tokens);
+                    this.isAuthenticated = true;
+                } catch (error) {
+                    console.error('Error loading existing tokens:', error);
+                    this.clearTokens();
+                }
+            } else {
+                console.log('No existing tokens found - user needs to authenticate');
+            }
+
+            // Initialize calendar API client
+            this.calendar = google.calendar({ version: 'v3', auth: this.oauth2Client });
+            this.timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+        } catch (error) {
+            console.error('OAuth initialization error:', error);
+            throw error;
+        }
+    }
 
     // Main command handler
     async handleCommand(parsedCommand: EnhancedParsedCommand): Promise<{
@@ -604,92 +694,6 @@ class GoogleCalendarService {
     }
 
     // Auth methods
-    private initializeOAuth() {
-        try {
-            // Make sure the credentials file exists and has correct data
-            if (!fs.existsSync(this.credentialsPath)) {
-                console.error('Credentials file not found:', this.credentialsPath);
-                this.isAuthenticated = false;
-                return;
-            }
-
-            const credentials = JSON.parse(fs.readFileSync(this.credentialsPath, 'utf-8'));
-
-            // Debug credentials content (remove sensitive data in production)
-            console.log("Credentials loaded:", {
-                hasClientId: !!credentials.web?.client_id,
-                hasClientSecret: !!credentials.web?.client_secret,
-                redirectUris: credentials.web?.redirect_uris
-            });
-
-            // Verify expected structure exists
-            if (!credentials.web || !credentials.web.client_id || !credentials.web.client_secret) {
-                console.error('Invalid credentials format');
-                this.isAuthenticated = false;
-                return;
-            }
-
-            const { client_secret, client_id, redirect_uris } = credentials.web;
-            console.log("redirect_uris", redirect_uris);
-
-            this.oauth2Client = new google.auth.OAuth2(
-                client_id,
-                client_secret,
-                redirect_uris[0]
-            );
-
-            if (fs.existsSync(this.tokenPath)) {
-                try {
-                    const tokens = JSON.parse(fs.readFileSync(this.tokenPath, 'utf-8'));
-
-                    // Check if token is expired
-                    if (tokens.expiry_date && tokens.expiry_date < Date.now()) {
-                        console.log("Token expired, clearing");
-                        this.clearTokens();
-                    } else {
-                        console.log("Setting credentials from stored tokens");
-                        this.oauth2Client.setCredentials(tokens);
-                        this.calendar = google.calendar({ version: 'v3', auth: this.oauth2Client });
-                        this.timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-                        this.isAuthenticated = true;
-
-                        // Verify credentials work
-                        this.testCredentials();
-                    }
-                } catch (error) {
-                    console.error("Error loading tokens, clearing:", error);
-                    this.clearTokens();
-                }
-            } else {
-                console.log("No tokens found at path:", this.tokenPath);
-            }
-
-            this.oauth2Client.on('tokens', (tokens) => {
-                console.log("New tokens received from OAuth flow");
-                let existingTokens = {};
-                if (fs.existsSync(this.tokenPath)) {
-                    existingTokens = JSON.parse(fs.readFileSync(this.tokenPath, 'utf-8'));
-                }
-                if (tokens.refresh_token) {
-                    this.saveTokens({
-                        ...existingTokens,
-                        ...tokens
-                    });
-                } else {
-                    // Even if no refresh token, update the access token
-                    this.saveTokens({
-                        ...existingTokens,
-                        access_token: tokens.access_token,
-                        expiry_date: tokens.expiry_date
-                    });
-                }
-            });
-        } catch (error) {
-            console.error('Error initializing OAuth:', error);
-            this.isAuthenticated = false;
-        }
-    }
-
     // Add a new method to test credentials
     private async testCredentials() {
         try {
@@ -971,35 +975,34 @@ class GoogleCalendarService {
 
     async handleAuthCallback(code: string) {
         try {
-            console.log("Handling auth callback with code:", code.substring(0, 5) + '...');
+            console.log("Handling auth callback with code");
 
             const { tokens } = await this.oauth2Client.getToken(code);
-            console.log("Tokens received:", {
+            console.log("Received tokens:", {
                 hasAccessToken: !!tokens.access_token,
                 hasRefreshToken: !!tokens.refresh_token,
                 expiryDate: tokens.expiry_date
             });
 
-            this.oauth2Client.setCredentials(tokens);
-            this.saveTokens(tokens);
-            this.calendar = google.calendar({ version: 'v3', auth: this.oauth2Client });
-            this.timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-            this.isAuthenticated = true;
-
-            // Test the auth immediately
-            try {
-                const service = google.oauth2('v2');
-                const userInfo = await service.userinfo.get({ auth: this.oauth2Client });
-                console.log("User info fetch successful after auth:", userInfo.data.email);
-            } catch (e) {
-                console.error("User info fetch failed after authentication:", e);
+            // Ensure tokens directory exists
+            const tokenDir = path.dirname(this.tokenPath);
+            if (!fs.existsSync(tokenDir)) {
+                fs.mkdirSync(tokenDir, { recursive: true });
             }
 
+            // Save tokens
+            fs.writeFileSync(this.tokenPath, JSON.stringify(tokens, null, 2));
+            
+            this.oauth2Client.setCredentials(tokens);
+            this.isAuthenticated = true;
+            
+            // Initialize calendar after successful auth
+            this.calendar = google.calendar({ version: 'v3', auth: this.oauth2Client });
+            
             return tokens;
         } catch (error) {
-            console.error('Error handling auth callback:', error);
-            this.isAuthenticated = false;
-            throw new Error('Failed to authenticate with Google Calendar');
+            console.error('Auth callback error:', error);
+            throw error;
         }
     }
 }

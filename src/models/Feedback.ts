@@ -8,6 +8,7 @@ export interface IFeedback extends Document {
   comments?: string;
   corrections?: string;
   createdAt: Date;
+  updatedAt: Date;
 }
 
 const FeedbackSchema: Schema = new Schema({
@@ -17,7 +18,13 @@ const FeedbackSchema: Schema = new Schema({
   wasHelpful: { type: Boolean, required: true },
   comments: { type: String },
   corrections: { type: String },
-  createdAt: { type: Date, default: Date.now }
-});
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+}, { timestamps: true });
+
+// Create indexes for common queries
+FeedbackSchema.index({ userId: 1 });
+FeedbackSchema.index({ responseId: 1 });
+FeedbackSchema.index({ createdAt: -1 });
 
 export default mongoose.model<IFeedback>('Feedback', FeedbackSchema);

@@ -115,8 +115,14 @@ export const logout = async (req: Request, res: Response) => {
 
 export const getAuthStatus = async (req: Request, res: Response) => {
     try {
+        console.log('Auth status check received:', {
+            headers: req.headers,
+            cookies: req.cookies
+        });
+
         // Important: await the async method
         const isAuthenticated = await googleCalendarService.isUserAuthenticated();
+        console.log('Auth status result:', isAuthenticated);
         res.json({ isAuthenticated });
     } catch (error) {
         console.error('Auth status check error:', error);

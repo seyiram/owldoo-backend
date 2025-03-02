@@ -442,12 +442,20 @@ class CalendarController {
      */
     checkAuthStatus = async (req: Request, res: Response) => {
         try {
+            console.log('Auth status check received:', {
+                headers: req.headers,
+                cookies: req.cookies
+            });
+            
             const isAuthenticated = await googleCalendarService.isUserAuthenticated();
+            console.log('Auth status result:', isAuthenticated);
+            
             return res.json({
                 isAuthenticated,
                 timestamp: new Date().toISOString()
             });
         } catch (error) {
+            console.error('Auth status check error:', error);
             return res.status(500).json({
                 error: error instanceof Error ? error.message : 'Failed to check auth status',
                 metadata: {
