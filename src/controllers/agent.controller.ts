@@ -18,16 +18,23 @@ export const queueTask = async (req: AuthenticatedRequest, res: Response) => {
       return res.status(401).json({ error: 'Authentication required' });
     }
 
-    const taskId = await agentService.addTask(task, priority, req.user.id, metadata);
+    console.log('Processing task:', { task, priority, metadata, userId: req.user.id });
+
+    // Process the task immediately instead of queueing it
+    const result = await agentService.processGenericTask(task, req.user.id);
     
+    // Return the response without queueing another task
     res.status(201).json({ 
-      message: 'Task queued successfully',
-      taskId
+      success: result.success,
+      message: result.message,
+      botResponse: result.processDetails,
+      initialResponse: result.initialResponse
     });
   } catch (error) {
     console.error('Error in agent.controller.queueTask:', error);
     res.status(500).json({
-      error: error instanceof Error ? error.message : 'Failed to queue task'
+      error: error instanceof Error ? error.message : 'Failed to process task',
+      botResponse: `Error: ${error instanceof Error ? error.message : 'Failed to process task'}`
     });
   }
 };

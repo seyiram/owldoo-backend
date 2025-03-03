@@ -282,10 +282,10 @@ Format the email with a subject line on the first line, followed by the body.`
         }
     }
 
-    private async processGenericTask(task: string, userId?: string): Promise<any> {
-        // Generic task processing logic
+    public async processGenericTask(task: string, userId?: string): Promise<any> {
         try {
-            const response = await this.client.messages.create({
+            // Get initial AI response
+            const aiResponse = await this.client.messages.create({
                 model: "claude-3-haiku-20240307",
                 max_tokens: 1024,
                 messages: [
@@ -300,15 +300,63 @@ Format the email with a subject line on the first line, followed by the body.`
                 ]
             });
 
+            const initialResponse = aiResponse.content[0].type === 'text' ? aiResponse.content[0].text : 'Unable to process response';
+
+            // Process the task
+            const parsedCommand = await nlpService.parseCommand(task);
+            console.log('Initial parsed command:', parsedCommand);
+
+            let processDetails = `${initialResponse}\n\n`;
+            processDetails += `Here's what I'm doing:\n\n`;
+            processDetails += `1. Understanding your request:\n${task}\n\n`;
+            processDetails += `2. Parsing command details:\n`;
+            processDetails += `- Type: ${parsedCommand.action}\n`;
+            processDetails += `- Date: ${parsedCommand.startTime ? new Date(parsedCommand.startTime).toLocaleString() : 'Not specified'}\n`;
+            processDetails += `- Duration: ${parsedCommand.duration} minutes\n\n`;
+
+            // Extract meeting details and email from the original task
+            const emailPattern = /[\w.+-]+@[\w-]+\.[\w.-]+/gi;
+            const titleMatch = task.match(/(?:meeting|call|appointment)\s+(?:with\s+)?([^@\n]+?)(?=\s+\w+@|\s*$)/i);
+            const emails = task.match(emailPattern) || [];
+            
+            // Get the name without the email part
+            const personName = titleMatch ? titleMatch[1].trim() : 'Untitled';
+            const title = `Meeting with ${personName}`;
+            const description = `${title} scheduled for ${parsedCommand.startTime ? new Date(parsedCommand.startTime).toLocaleString() : 'specified time'}`;
+
+            processDetails += `3. Creating calendar event with:\n`;
+            processDetails += `- Title: ${title}\n`;
+            processDetails += `- Description: ${description}\n`;
+            processDetails += `- Attendees: ${emails.join(', ') || 'None'}\n\n`;
+
+            // Create the event
+            const event = await googleCalendarService.createEvent({
+                ...parsedCommand,
+                title,
+                description,
+                startTime: parsedCommand.startTime,
+                attendees: emails // Pass the extracted emails
+            });
+
+            processDetails += `4. Event created successfully!\n`;
+            processDetails += `- Event ID: ${event.id}\n`;
+            processDetails += `- Start time: ${new Date(event.start.dateTime).toLocaleString()}\n`;
+            processDetails += `- End time: ${new Date(event.end.dateTime).toLocaleString()}\n`;
+            processDetails += `- Attendees: ${emails.join(', ') || 'None'}\n`;
+
             return {
                 success: true,
-                result: response.content[0].type === 'text' ? response.content[0].text : 'Unable to process response'
+                result: `Created event: ${title}`,
+                processDetails: processDetails,
+                message: processDetails,
+                initialResponse: initialResponse
             };
         } catch (error) {
             console.error('Error processing generic task:', error);
             return {
                 success: false,
-                error: error instanceof Error ? error.message : 'Unknown error'
+                error: error instanceof Error ? error.message : 'Unknown error',
+                message: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`
             };
         }
     }
@@ -453,90 +501,92 @@ Format as JSON array.`
 
     async getUserStats(userId: string): Promise<any> {
         try {
-          // Get tasks for this user
-          const AgentTask = mongoose.model('AgentTask');
-          const tasks = await AgentTask.find({ userId });
-          
-          // Get suggestions for this user
-          const Suggestion = mongoose.model('Suggestion');
-          const suggestions = await Suggestion.find({ userId });
-          
-          // Get insights for this user
-          const Insight = mongoose.model('Insight');
-          const insights = await Insight.find({ userId });
-          
-          // Get events from calendar
-          const now = new Date();
-          const oneMonthAgo = new Date(now);
-          oneMonthAgo.setMonth(now.getMonth() - 1);
-          const events = await googleCalendarService.getEvents(oneMonthAgo, now);
-          
-          // Calculate statistics
-          const totalEvents = events.length;
-          const suggestionsGenerated = suggestions.length;
-          const suggestionsAccepted = suggestions.filter(s => s.status === 'accepted').length;
-          const suggestionsAcceptedRate = suggestionsGenerated > 0 
-            ? Math.round((suggestionsAccepted / suggestionsGenerated) * 100) 
-            : 0;
-          
-          // Calculate task distribution
-          const taskDistribution = [
-            { name: 'Calendar Optimization', value: tasks.filter(t => t.title?.includes('calendar') || t.description?.includes('calendar')).length },
-            { name: 'Email Drafting', value: tasks.filter(t => t.title?.includes('email') || t.description?.includes('email')).length },
-            { name: 'Meeting Analysis', value: tasks.filter(t => t.title?.includes('meeting') || t.description?.includes('meeting')).length },
-            { name: 'Productivity Insights', value: tasks.filter(t => t.title?.includes('productivity') || t.description?.includes('productivity')).length },
-            { name: 'Other Tasks', value: tasks.length - (
-              tasks.filter(t => 
-                t.title?.includes('calendar') || t.description?.includes('calendar') ||
-                t.title?.includes('email') || t.description?.includes('email') ||
-                t.title?.includes('meeting') || t.description?.includes('meeting') ||
-                t.title?.includes('productivity') || t.description?.includes('productivity')
-              ).length
-            ) }
-          ];
-          
-          // Filter out categories with zero values
-          const filteredTaskDistribution = taskDistribution.filter(item => item.value > 0);
-          
-          // Get weekly activity
-          const weeklyActivity = [
-            { day: 'Sun', tasks: 0, events: 0 },
-            { day: 'Mon', tasks: 0, events: 0 },
-            { day: 'Tue', tasks: 0, events: 0 },
-            { day: 'Wed', tasks: 0, events: 0 },
-            { day: 'Thu', tasks: 0, events: 0 },
-            { day: 'Fri', tasks: 0, events: 0 },
-            { day: 'Sat', tasks: 0, events: 0 }
-          ];
-          
-          events.forEach(event => {
-            const day = new Date(event.start.dateTime).getDay();
-            weeklyActivity[day].events++;
-          });
-          
-          tasks.forEach(task => {
-            const day = new Date(task.createdAt).getDay();
-            weeklyActivity[day].tasks++;
-          });
-          
-          return {
-            eventsManaged: totalEvents,
-            suggestionsGenerated,
-            suggestionsAcceptedRate,
-            insightsGenerated: insights.length,
-            taskDistribution: filteredTaskDistribution,
-            weeklyActivity,
-            averageConfidence: 85, // Placeholder - could be calculated from actual confidence scores
-            accuracyRate: 92, // Placeholder - could be calculated from feedback
-            userSatisfaction: 8.7 // Placeholder - could be calculated from feedback
-          };
+            // Get tasks for this user
+            const AgentTask = mongoose.model('AgentTask');
+            const tasks = await AgentTask.find({ userId });
+
+            // Get suggestions for this user
+            const Suggestion = mongoose.model('Suggestion');
+            const suggestions = await Suggestion.find({ userId });
+
+            // Get insights for this user
+            const Insight = mongoose.model('Insight');
+            const insights = await Insight.find({ userId });
+
+            // Get events from calendar
+            const now = new Date();
+            const oneMonthAgo = new Date(now);
+            oneMonthAgo.setMonth(now.getMonth() - 1);
+            const events = await googleCalendarService.getEvents(oneMonthAgo, now);
+
+            // Calculate statistics
+            const totalEvents = events.length;
+            const suggestionsGenerated = suggestions.length;
+            const suggestionsAccepted = suggestions.filter(s => s.status === 'accepted').length;
+            const suggestionsAcceptedRate = suggestionsGenerated > 0
+                ? Math.round((suggestionsAccepted / suggestionsGenerated) * 100)
+                : 0;
+
+            // Calculate task distribution
+            const taskDistribution = [
+                { name: 'Calendar Optimization', value: tasks.filter(t => t.title?.includes('calendar') || t.description?.includes('calendar')).length },
+                { name: 'Email Drafting', value: tasks.filter(t => t.title?.includes('email') || t.description?.includes('email')).length },
+                { name: 'Meeting Analysis', value: tasks.filter(t => t.title?.includes('meeting') || t.description?.includes('meeting')).length },
+                { name: 'Productivity Insights', value: tasks.filter(t => t.title?.includes('productivity') || t.description?.includes('productivity')).length },
+                {
+                    name: 'Other Tasks', value: tasks.length - (
+                        tasks.filter(t =>
+                            t.title?.includes('calendar') || t.description?.includes('calendar') ||
+                            t.title?.includes('email') || t.description?.includes('email') ||
+                            t.title?.includes('meeting') || t.description?.includes('meeting') ||
+                            t.title?.includes('productivity') || t.description?.includes('productivity')
+                        ).length
+                    )
+                }
+            ];
+
+            // Filter out categories with zero values
+            const filteredTaskDistribution = taskDistribution.filter(item => item.value > 0);
+
+            // Get weekly activity
+            const weeklyActivity = [
+                { day: 'Sun', tasks: 0, events: 0 },
+                { day: 'Mon', tasks: 0, events: 0 },
+                { day: 'Tue', tasks: 0, events: 0 },
+                { day: 'Wed', tasks: 0, events: 0 },
+                { day: 'Thu', tasks: 0, events: 0 },
+                { day: 'Fri', tasks: 0, events: 0 },
+                { day: 'Sat', tasks: 0, events: 0 }
+            ];
+
+            events.forEach(event => {
+                const day = new Date(event.start.dateTime).getDay();
+                weeklyActivity[day].events++;
+            });
+
+            tasks.forEach(task => {
+                const day = new Date(task.createdAt).getDay();
+                weeklyActivity[day].tasks++;
+            });
+
+            return {
+                eventsManaged: totalEvents,
+                suggestionsGenerated,
+                suggestionsAcceptedRate,
+                insightsGenerated: insights.length,
+                taskDistribution: filteredTaskDistribution,
+                weeklyActivity,
+                averageConfidence: 85, // Placeholder - could be calculated from actual confidence scores
+                accuracyRate: 92, // Placeholder - could be calculated from feedback
+                userSatisfaction: 8.7 // Placeholder - could be calculated from feedback
+            };
         } catch (error) {
-          console.error('Error getting user stats:', error);
-          return {
-            error: error instanceof Error ? error.message : 'Unknown error'
-          };
+            console.error('Error getting user stats:', error);
+            return {
+                error: error instanceof Error ? error.message : 'Unknown error'
+            };
         }
-      }
+    }
 
     private async generateCancellationEmail(event: any): Promise<string> {
         const response = await this.client.messages.create({

@@ -126,6 +126,7 @@ class GoogleCalendarService {
         error?: string;
         suggestion?: Date;
     }> {
+        console.log('Handling command:', parsedCommand);
         return this.executeWithAuth(async () => {
             switch (parsedCommand.action) {
                 case 'create':
@@ -143,6 +144,7 @@ class GoogleCalendarService {
     }
 
     private async handleCreateCommand(parsedCommand: EnhancedParsedCommand) {
+        console.log('Handling create command:', parsedCommand);
         const endTime = this.calculateEndTime(parsedCommand.startTime, parsedCommand.duration);
         const isAvailable = await this.checkAvailability(parsedCommand.startTime, endTime);
 
@@ -367,14 +369,22 @@ class GoogleCalendarService {
             const endTime = this.calculateEndTime(parsedCommand.startTime, parsedCommand.duration);
             const eventResource = this.createEventResource(parsedCommand, endTime);
 
-            const response = await this.calendar.events.insert({
-                calendarId: 'primary',
-                requestBody: eventResource,
-                conferenceDataVersion: 1,
-                sendUpdates: 'all'
-            });
+            console.log('Creating event with resource:', eventResource);
 
-            return response.data as CalendarEvent;
+            try {
+                const response = await this.calendar.events.insert({
+                    calendarId: 'primary',
+                    requestBody: eventResource,
+                    conferenceDataVersion: 1,
+                    sendUpdates: 'all'
+                });
+
+                console.log('Event created:', response.data);
+                return response.data as CalendarEvent;
+            } catch (error) {
+                console.error('Error creating event:', error);
+                throw error;
+            }
         });
     }
 
