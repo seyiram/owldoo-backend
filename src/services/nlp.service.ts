@@ -36,7 +36,39 @@ class NLPService {
         moveCommand: /(?:change|move|reschedule)\s+(?:the|my)?\s*(?:date|time)?\s*(?:for|of)?\s*(.+?)\s+to/i,
     }
 
+    private detectEventType(text: string): { 
+        type: 'work' | 'meeting' | 'other',
+        isWorkSchedule: boolean 
+    } {
+        const lowerText = text.toLowerCase();
+        
+        // Check for work schedule patterns first
+        const workPatterns = [
+            /\b(schedule|set|plan)\s+work\b/i,
+            /\bwork\s+(schedule|time|hours)\b/i,
+            /\bworking\s+(from|hours)\b/i
+        ];
 
+        const isWorkSchedule = workPatterns.some(pattern => pattern.test(text));
+        if (isWorkSchedule) {
+            return { type: 'work', isWorkSchedule: true };
+        }
+
+        // Then check for meeting patterns
+        const meetingPatterns = [
+            /\bmeeting\b/i,
+            /\bcall\b/i,
+            /\bappointment\b/i,
+            /\bsync\b/i
+        ];
+
+        const isMeeting = meetingPatterns.some(pattern => pattern.test(text));
+        if (isMeeting) {
+            return { type: 'meeting', isWorkSchedule: false };
+        }
+
+        return { type: 'other', isWorkSchedule: false };
+    }
 
     private async parseUpdateCommand(input: string): Promise<EnhancedParsedCommand> {
         const moveMatch = input.match(this.MEETING_PATTERNS.moveCommand);
@@ -147,6 +179,20 @@ class NLPService {
                 anthroParsedCommand.videoLink = videoLink;
             }
 
+            const eventType = this.detectEventType(input);
+        
+            // Set the appropriate title and context based on event type
+            if (eventType.isWorkSchedule) {
+                finalParsedCommand.title = 'Work';
+                finalParsedCommand.context = {
+                    ...finalParsedCommand.context,
+                    isWorkSchedule: true,
+                    isUrgent: false,
+                    isFlexible: false,
+                    priority: 'normal',
+                    timePreference: 'exact'
+                };
+            }
 
             return finalParsedCommand;
         } catch (error) {

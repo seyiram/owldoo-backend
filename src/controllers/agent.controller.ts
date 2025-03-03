@@ -18,23 +18,43 @@ export const queueTask = async (req: AuthenticatedRequest, res: Response) => {
       return res.status(401).json({ error: 'Authentication required' });
     }
 
+    // Validate task input
+    if (!task || typeof task !== 'string' || task.trim().length === 0) {
+      return res.status(400).json({ 
+        error: 'Invalid task format',
+        message: 'Task must be a non-empty string'
+      });
+    }
+
+    // Validate task length
+    if (task.length > 500) {
+      return res.status(400).json({
+        error: 'Task too long',
+        message: 'Task must be less than 500 characters'
+      });
+    }
+
     console.log('Processing task:', { task, priority, metadata, userId: req.user.id });
 
-    // Process the task immediately instead of queueing it
-    const result = await agentService.processGenericTask(task, req.user.id);
-    
-    // Return the response without queueing another task
-    res.status(201).json({ 
-      success: result.success,
-      message: result.message,
-      botResponse: result.processDetails,
-      initialResponse: result.initialResponse
-    });
+    // Set up streaming response
+    res.setHeader('Content-Type', 'text/plain');
+    res.setHeader('Transfer-Encoding', 'chunked');
+
+    // Process the task with streaming updates - note the reordered parameters
+    const streamProcessor = await agentService.processGenericTaskWithStream(
+        task,
+        (chunk: string) => {
+            res.write(chunk);
+        },
+        req.user.id
+    );
+
+    await streamProcessor;
+    res.end();
   } catch (error) {
     console.error('Error in agent.controller.queueTask:', error);
     res.status(500).json({
       error: error instanceof Error ? error.message : 'Failed to process task',
-      botResponse: `Error: ${error instanceof Error ? error.message : 'Failed to process task'}`
     });
   }
 };

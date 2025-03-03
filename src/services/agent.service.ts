@@ -284,10 +284,215 @@ Format the email with a subject line on the first line, followed by the body.`
 
     public async processGenericTask(task: string, userId?: string): Promise<any> {
         try {
-            // Get initial AI response
+            // Process the task
+            const parsedCommand = await nlpService.parseCommand(task);
+            console.log('Initial parsed command:', parsedCommand);
+
+            // Extract event type from command
+            const eventType = this.identifyEventType(task);
+            const isWorkSchedule = eventType === 'work';
+
+            // Generate appropriate title and description
+            const title = isWorkSchedule ? 'Work' : this.generateTitle(parsedCommand, task);
+
+            // Modify description to be more appropriate for work schedules
+            const description = isWorkSchedule 
+                ? `Work scheduled from ${new Date(parsedCommand.startTime).toLocaleString()} to ${
+                    new Date(new Date(parsedCommand.startTime).getTime() + parsedCommand.duration * 60000).toLocaleString()
+                  }`
+                : this.generateDescription(parsedCommand, task);
+
+            let processDetails = 'Processing your request:\n\n';
+            processDetails += `1. Understanding your request:\n${task}\n\n`;
+            processDetails += `2. Scheduling details:\n`;
+            processDetails += `- Type: ${isWorkSchedule ? 'Work Schedule' : parsedCommand.action}\n`;
+            processDetails += `- Start: ${parsedCommand.startTime ? new Date(parsedCommand.startTime).toLocaleString() : 'Not specified'}\n`;
+            processDetails += `- Duration: ${parsedCommand.duration} minutes\n\n`;
+
+            // Create the event with properly typed context
+            const event = await googleCalendarService.createEvent({
+                ...parsedCommand,
+                title,
+                description,
+                context: {
+                    isUrgent: parsedCommand.context?.isUrgent || false,
+                    isFlexible: parsedCommand.context?.isFlexible || false,
+                    priority: parsedCommand.context?.priority || 'normal',
+                    timePreference: parsedCommand.context?.timePreference || 'approximate',
+                    isWorkSchedule // This is now optional
+                }
+            });
+
+            processDetails += `3. Schedule created successfully!\n`;
+            processDetails += `- Title: ${title}\n`;
+            processDetails += `- Start: ${new Date(event.start.dateTime).toLocaleString()}\n`;
+            processDetails += `- End: ${new Date(event.end.dateTime).toLocaleString()}\n`;
+
+            return {
+                success: true,
+                result: `Created ${isWorkSchedule ? 'work schedule' : 'event'}: ${title}`,
+                processDetails,
+                message: processDetails,
+            };
+        } catch (error) {
+            console.error('Error processing task:', error);
+            return {
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error',
+                message: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`
+            };
+        }
+    }
+
+    private generateTitle(parsedCommand: any, task: string): string {
+        // If it's a simple work schedule, just return 'Work'
+        if (this.identifyEventType(task) === 'work') {
+            return 'Work';
+        }
+
+        // Extract potential title from parsed command
+        if (parsedCommand.title) {
+            return this.toTitleCase(parsedCommand.title);
+        }
+
+        // Extract meeting details
+        const meetingMatch = task.match(/(?:meeting|call|appointment)\s+(?:with\s+)?([^@\n]+?)(?=\s+[\w.+-]+@[\w-]+\.[\w.-]+|\s*$)/i);
+        if (meetingMatch) {
+            return `Meeting with ${this.toTitleCase(meetingMatch[1].trim())}`;
+        }
+
+        // Default to generic event name
+        return 'Calendar Event';
+    }
+
+    private generateDescription(parsedCommand: any, task: string): string {
+        // Identify event type from task and context
+        const eventType = this.identifyEventType(task);
+        const details = [];
+
+        // Add base description
+        if (parsedCommand.description) {
+            details.push(parsedCommand.description);
+        }
+
+        // Add event type specific details
+        switch (eventType) {
+            case 'work':
+                details.push(`🏢 Work Schedule`);
+                if (parsedCommand.location) {
+                    details.push(`📍 Location: ${parsedCommand.location === 'wfh' ? 'Working from Home' : parsedCommand.location}`);
+                }
+                break;
+
+            case 'meeting':
+                if (parsedCommand.attendees?.length) {
+                    details.push(`👥 Attendees: ${parsedCommand.attendees.join(', ')}`);
+                }
+                if (parsedCommand.videoLink) {
+                    details.push(`🎥 Video Link: ${parsedCommand.videoLink}`);
+                }
+                break;
+
+            case 'deadline':
+                details.push('⏰ Important Deadline');
+                break;
+
+            case 'personal':
+                details.push('🏠 Personal Event');
+                break;
+
+            case 'travel':
+
+            case 'exercise':
+                details.push('🏃‍♂️ Exercise/Workout');
+                break;
+
+            case 'meal':
+                details.push('🍽️ Meal Time');
+                break;
+        }
+
+        // Add context-based information
+        if (parsedCommand.context) {
+            if (parsedCommand.context.isUrgent) {
+                details.push('⚠️ High Priority');
+            }
+            if (parsedCommand.context.isFlexible) {
+                details.push('⚡ Flexible Timing');
+            }
+            if (parsedCommand.context.priority === 'high') {
+                details.push('🔥 Important');
+            }
+        }
+
+        // Add notes or additional information
+        if (parsedCommand.notes) {
+            details.push(`📝 Notes: ${parsedCommand.notes}`);
+        }
+
+        // Add metadata
+        if (parsedCommand.metadata) {
+            details.push(`Created: ${new Date(parsedCommand.metadata.parseTime).toLocaleString()}`);
+            if (parsedCommand.metadata.confidence < 0.8) {
+                details.push('⚠️ Some details may need verification');
+            }
+        }
+
+        return details.join('\n\n');
+    }
+
+    private identifyEventType(task: string): string {
+        const taskLower = task.toLowerCase();
+        
+        // Check for work schedule first - make this pattern more specific
+        const workSchedulePattern = /\b(?:schedule|set|plan)?\s*work\s*(?:from|at|for|until)?\b/i;
+        if (workSchedulePattern.test(taskLower) && 
+            !taskLower.includes('meeting') && 
+            !taskLower.includes('call')) {
+            return 'work';
+        }
+
+        // Rest of the patterns remain the same
+        const patterns = {
+            meeting: /\b(meet|meeting|call|sync|appointment|interview)\b/,
+            deadline: /\b(deadline|due|by|until)\b/,
+            personal: /\b(personal|family|kids|home|life)\b/,
+            travel: /\b(travel|trip|flight|journey|commute)\b/,
+            exercise: /\b(exercise|workout|gym|training|fitness)\b/,
+            meal: /\b(lunch|dinner|breakfast|meal|food)\b/
+        };
+
+        // Check for explicit mentions
+        for (const [type, pattern] of Object.entries(patterns)) {
+            if (pattern.test(taskLower)) {
+                return type;
+            }
+        }
+
+        // Analyze context for implicit type
+        if (taskLower.includes('@') || taskLower.includes('zoom') || taskLower.includes('teams')) {
+            return 'meeting';
+        }
+
+        if (taskLower.includes('wfh') || taskLower.includes('office')) {
+            return 'work';
+        }
+
+        // Default to generic event type
+        return 'event';
+    }
+
+    public async processGenericTaskWithStream(
+        task: string,
+        onChunk: (chunk: string) => void,
+        userId?: string
+    ): Promise<void> {
+        try {
+            // Stream initial AI response
             const aiResponse = await this.client.messages.create({
                 model: "claude-3-haiku-20240307",
                 max_tokens: 1024,
+                stream: true,
                 messages: [
                     {
                         role: "user",
@@ -300,65 +505,94 @@ Format the email with a subject line on the first line, followed by the body.`
                 ]
             });
 
-            const initialResponse = aiResponse.content[0].type === 'text' ? aiResponse.content[0].text : 'Unable to process response';
+            // Stream the initial response
+            for await (const chunk of aiResponse) {
+                if ('type' in chunk && chunk.type === 'content_block_delta' &&
+                    'delta' in chunk && 'text' in chunk.delta) {
+                    onChunk(chunk.delta.text);
+                }
+            }
 
             // Process the task
             const parsedCommand = await nlpService.parseCommand(task);
-            console.log('Initial parsed command:', parsedCommand);
+            console.log('Parsed command:', parsedCommand);
 
-            let processDetails = `${initialResponse}\n\n`;
-            processDetails += `Here's what I'm doing:\n\n`;
-            processDetails += `1. Understanding your request:\n${task}\n\n`;
-            processDetails += `2. Parsing command details:\n`;
-            processDetails += `- Type: ${parsedCommand.action}\n`;
-            processDetails += `- Date: ${parsedCommand.startTime ? new Date(parsedCommand.startTime).toLocaleString() : 'Not specified'}\n`;
-            processDetails += `- Duration: ${parsedCommand.duration} minutes\n\n`;
+            // Extract event type from command - align with processGenericTask
+            const eventType = this.identifyEventType(task);
+            const isWorkSchedule = eventType === 'work';
+            console.log('Event type:', eventType, 'Is work schedule:', isWorkSchedule);
 
-            // Extract meeting details and email from the original task
-            const emailPattern = /[\w.+-]+@[\w-]+\.[\w.-]+/gi;
-            const titleMatch = task.match(/(?:meeting|call|appointment)\s+(?:with\s+)?([^@\n]+?)(?=\s+\w+@|\s*$)/i);
-            const emails = task.match(emailPattern) || [];
-            
-            // Get the name without the email part
-            const personName = titleMatch ? titleMatch[1].trim() : 'Untitled';
-            const title = `Meeting with ${personName}`;
-            const description = `${title} scheduled for ${parsedCommand.startTime ? new Date(parsedCommand.startTime).toLocaleString() : 'specified time'}`;
+            // Generate appropriate title
+            const title = isWorkSchedule ? 'Work' : this.generateTitle(parsedCommand, task);
+            console.log('Generated title:', title);
 
-            processDetails += `3. Creating calendar event with:\n`;
-            processDetails += `- Title: ${title}\n`;
-            processDetails += `- Description: ${description}\n`;
-            processDetails += `- Attendees: ${emails.join(', ') || 'None'}\n\n`;
+            // Stream the processing details
+            const details = [
+                '\n\nHere\'s what I\'m doing:\n\n',
+                `1. Understanding your request:\n${task}\n\n`,
+                '2. Parsing command details:\n',
+                `- Type: ${isWorkSchedule ? 'Work Schedule' : parsedCommand.action}\n`,
+                `- Start: ${parsedCommand.startTime ? new Date(parsedCommand.startTime).toLocaleString() : 'Not specified'}\n`,
+                `- Duration: ${parsedCommand.duration} minutes\n\n`
+            ];
+
+            // Stream each detail
+            for (const detail of details) {
+                onChunk(detail);
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+
+            // Extract attendees if it's a meeting
+            const attendees = !isWorkSchedule ? this.extractAttendees(task) : [];
+
+            // Generate description
+            const description = isWorkSchedule 
+                ? `Work scheduled from ${new Date(parsedCommand.startTime).toLocaleString()} to ${
+                    new Date(new Date(parsedCommand.startTime).getTime() + parsedCommand.duration * 60000).toLocaleString()
+                  }`
+                : `${title} scheduled for ${parsedCommand.startTime ? new Date(parsedCommand.startTime).toLocaleString() : 'specified time'}`;
+
+            onChunk('3. Creating calendar event with:\n');
+            onChunk(`- Title: ${title}\n`);
+            onChunk(`- Description: ${description}\n`);
+            if (attendees.length > 0) {
+                onChunk(`- Attendees: ${attendees.join(', ')}\n`);
+            }
+            onChunk('\n');
 
             // Create the event
             const event = await googleCalendarService.createEvent({
                 ...parsedCommand,
                 title,
                 description,
-                startTime: parsedCommand.startTime,
-                attendees: emails // Pass the extracted emails
+                context: {
+                    isUrgent: parsedCommand.context?.isUrgent || false,
+                    isFlexible: parsedCommand.context?.isFlexible || false,
+                    priority: parsedCommand.context?.priority || 'normal',
+                    timePreference: parsedCommand.context?.timePreference || 'approximate',
+                    isWorkSchedule
+                },
+                attendees
             });
 
-            processDetails += `4. Event created successfully!\n`;
-            processDetails += `- Event ID: ${event.id}\n`;
-            processDetails += `- Start time: ${new Date(event.start.dateTime).toLocaleString()}\n`;
-            processDetails += `- End time: ${new Date(event.end.dateTime).toLocaleString()}\n`;
-            processDetails += `- Attendees: ${emails.join(', ') || 'None'}\n`;
+            // Stream the confirmation
+            onChunk('4. Event created successfully!\n');
+            onChunk(`- Event ID: ${event.id}\n`);
+            onChunk(`- Start: ${new Date(event.start.dateTime).toLocaleString()}\n`);
+            onChunk(`- End: ${new Date(event.end.dateTime).toLocaleString()}\n`);
+            if (attendees.length > 0) {
+                onChunk(`- Attendees: ${attendees.join(', ')}\n`);
+            }
 
-            return {
-                success: true,
-                result: `Created event: ${title}`,
-                processDetails: processDetails,
-                message: processDetails,
-                initialResponse: initialResponse
-            };
         } catch (error) {
             console.error('Error processing generic task:', error);
-            return {
-                success: false,
-                error: error instanceof Error ? error.message : 'Unknown error',
-                message: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`
-            };
+            onChunk(`\nError: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
+    }
+
+    private extractAttendees(task: string): string[] {
+        const emailPattern = /[\w.+-]+@[\w-]+\.[\w.-]+/gi;
+        return task.match(emailPattern) || [];
     }
 
     async analyzeData(taskType: string, userId?: string, metadata?: any): Promise<any> {
@@ -972,6 +1206,14 @@ Format as JSON array.`
             console.error('Error sending email:', error);
             throw error;
         }
+    }
+
+    private toTitleCase(str: string): string {
+        return str
+            .toLowerCase()
+            .split(' ')
+            .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+            .join(' ');
     }
 }
 

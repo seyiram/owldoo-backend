@@ -79,6 +79,7 @@ export interface Context {
     isFlexible: boolean;
     priority: 'low' | 'normal' | 'high';
     timePreference: 'exact' | 'approximate' | 'flexible';
+    isWorkSchedule?: boolean;  // Add this property
 }
 
 export interface Recurrence {
