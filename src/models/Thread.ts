@@ -4,6 +4,7 @@ export interface IThread extends Document {
   messages: Message[];
   createdAt: Date;
   userId?: Schema.Types.ObjectId;
+  conversationId?: string; // Reference to Conversation model
   processingSteps?: AgentProcessingStep[]; // Add processing steps
   relatedAgentTasks?: string[]; // References to agent task IDs
 }
@@ -57,6 +58,11 @@ const threadSchema = new Schema<IThread>({
     type: Schema.Types.ObjectId,
     ref: 'User',
     required: true,
+  },
+  conversationId: {
+    type: String,
+    ref: 'Conversation',
+    index: true
   },
   processingSteps: [processingStepSchema], // Add processing steps array
   relatedAgentTasks: [String] // Array of agent task IDs

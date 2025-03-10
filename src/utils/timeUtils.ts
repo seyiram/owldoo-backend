@@ -16,6 +16,10 @@ export function formatDateTime(date: Date): string {
     iso: date.toISOString(),
     hours: date.getHours(),
     minutes: date.getMinutes(),
+    day: date.getDate(),
+    month: date.getMonth() + 1,
+    year: date.getFullYear(),
+    currentDay: new Date().getDate(),
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     timezoneOffset: date.getTimezoneOffset() / 60
   });
@@ -24,6 +28,19 @@ export function formatDateTime(date: Date): string {
   const hour = date.getHours();
   if (hour > 20 && hour <= 23) { // Late night hours that might be wrong
     console.log('FORMAT DATE TIME: Possible timezone issue detected - hour is in late evening');
+  }
+  
+  // Add explicit check to ensure the day is correct - this is important for "today" events
+  const today = new Date();
+  if (date.toDateString().includes('tomorrow') || 
+      (date.getDate() === today.getDate() + 1 && 
+       date.getMonth() === today.getMonth() && 
+       date.getFullYear() === today.getFullYear())) {
+    console.warn('DATE CORRECTION: Event appears to be scheduled for tomorrow instead of today');
+    // Adjust the date back to today while preserving the time
+    date = new Date(date);
+    date.setDate(today.getDate());
+    console.log('Corrected date:', date.toString());
   }
   
   const timeOptions: Intl.DateTimeFormatOptions = { 

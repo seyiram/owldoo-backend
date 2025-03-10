@@ -93,7 +93,12 @@ class ConversationService {
         throw new Error(errorData.error || 'Failed to get conversation by thread');
       }
 
-      return await response.json();
+      const data = await response.json();
+      
+      // Log the response for debugging
+      console.log('Response from getConversationByThread:', data);
+      
+      return data;
     } catch (error) {
       console.error('Error in getConversationByThread:', error);
       throw error;

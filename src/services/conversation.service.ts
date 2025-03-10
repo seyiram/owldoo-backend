@@ -125,21 +125,22 @@ class ConversationService {
       // Generate a thread in the database if one doesn't exist or validate existing one
       try {
         // Get the original user message from this conversation
-        const userMessage = conversation.turns.find(turn => turn.speaker === 'user')?.content;
+        const userMessage = message; // Use the current message instead of searching in turns
         
         if (!conversation.threadId) {
-          console.log(`No thread ID exists - creating a new thread for conversation ${conversation.conversationId}`);
-          console.log(`Original user message: "${userMessage}"`);
+          console.log('Creating new thread for message:', userMessage);
           
-          // Create a thread in the database
+          // Create a thread in the database with just the current message
           const Thread = mongoose.model('Thread');
-          const messages = conversation.turns.map(turn => ({
-            sender: turn.speaker === 'user' ? 'user' : 'bot',
-            content: turn.content,
-            timestamp: turn.timestamp
-          }));
+          const messages = [
+            {
+              sender: 'user',
+              content: message,
+              timestamp: new Date()
+            }
+          ];
           
-          console.log('Thread messages being created:', JSON.stringify(messages, null, 2));
+          console.log('Creating new thread with messages:', messages);
           
           const newThread = await Thread.create({
             userId: conversation.userId,
@@ -154,70 +155,23 @@ class ConversationService {
           
           console.log(`Created new thread ${newThread._id} for conversation ${conversation.conversationId}`);
         } else {
-          // Verify the thread exists and has the correct content
-          console.log(`Thread ID exists (${conversation.threadId}) - verifying content matches`);
-          
+          // Add message to existing thread
           const Thread = mongoose.model('Thread');
-          const existingThread = await Thread.findById(conversation.threadId);
-          
-          if (!existingThread) {
-            console.log(`Thread ${conversation.threadId} not found! Creating a new one...`);
-            // Create a new thread since the existing one is missing
-            const messages = conversation.turns.map(turn => ({
-              sender: turn.speaker === 'user' ? 'user' : 'bot',
-              content: turn.content,
-              timestamp: turn.timestamp
-            }));
-            
-            const newThread = await Thread.create({
-              userId: conversation.userId,
-              messages,
-              createdAt: conversation.startTime,
-              conversationId: conversation.conversationId
-            });
-            
-            // Update conversation with the new thread ID
-            conversation.threadId = newThread._id.toString();
-            await conversation.save();
-            
-            console.log(`Created replacement thread ${newThread._id} for conversation ${conversation.conversationId}`);
-          } else {
-            // Check if the first user message in the thread matches our current conversation
-            const threadFirstUserMsg = existingThread.messages.find((m: any) => m.sender === 'user')?.content;
-            console.log(`Thread first user message: "${threadFirstUserMsg}"`);
-            console.log(`Conversation first user message: "${userMessage}"`);
-            
-            if (threadFirstUserMsg !== userMessage) {
-              console.log(`MISMATCH DETECTED between thread and conversation!`);
-              console.log(`Creating new thread with correct content...`);
-              
-              // Create a new thread with the correct content
-              const messages = conversation.turns.map(turn => ({
-                sender: turn.speaker === 'user' ? 'user' : 'bot',
-                content: turn.content,
-                timestamp: turn.timestamp
-              }));
-              
-              const newThread = await Thread.create({
-                userId: conversation.userId,
-                messages,
-                createdAt: conversation.startTime,
-                conversationId: conversation.conversationId
-              });
-              
-              // Update conversation with the new thread ID
-              conversation.threadId = newThread._id.toString();
-              await conversation.save();
-              
-              console.log(`Created corrected thread ${newThread._id} for conversation ${conversation.conversationId}`);
-            } else {
-              console.log(`Thread content verified - using existing thread ${conversation.threadId}`);
+          await Thread.findByIdAndUpdate(
+            conversation.threadId,
+            {
+              $push: {
+                messages: {
+                  sender: 'user',
+                  content: message,
+                  timestamp: new Date()
+                }
+              }
             }
-          }
+          );
         }
       } catch (threadError) {
-        console.error('Error managing thread for conversation:', threadError);
-        // We'll continue even if thread creation fails
+        console.error('Error managing thread:', threadError);
       }
       
       // Define a proper return type that includes conversationId and threadId

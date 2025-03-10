@@ -210,11 +210,21 @@ class NLPService {
      * @returns Detected intent type and confidence
      */
     private async detectIntentType(input: string): Promise<{
-        intent: 'create' | 'update' | 'delete' | 'query';
+        intent: 'create' | 'update' | 'delete' | 'query' | 'confirm';
         confidence: number;
         queryType?: 'availability' | 'event_details';
     }> {
         try {
+            // Check for simple confirmations first (very fast)
+            const confirmationRegex = /^\s*(yes|yeah|yep|sure|ok|okay|correct|right|sounds good|that works)\s*$/i;
+            if (confirmationRegex.test(input)) {
+                console.log('Simple confirmation detected via regex');
+                return {
+                    intent: 'confirm',
+                    confidence: 0.95
+                };
+            }
+            
             return await this.retry(async () => {
                 const response = await this.client.messages.create({
                     model: "claude-3-haiku-20240307", // Using smaller model for faster response
@@ -230,13 +240,14 @@ class NLPService {
                             2. UPDATE (change, move, reschedule an event)
                             3. DELETE (cancel, remove an event)
                             4. QUERY (check, show, list, find events or availability)
+                            5. CONFIRM (yes, okay, sounds good, that works - confirmations to suggestions)
                             
                             If it's a QUERY, also specify the query type as either:
                             - 'availability' (checking if a time is free)
                             - 'event_details' (finding events or details about events)
                             
                             Return a JSON object with:
-                            - intent: "create", "update", "delete", or "query"
+                            - intent: "create", "update", "delete", "query", or "confirm"
                             - confidence: number between 0-1
                             - queryType: "availability" or "event_details" (only if intent is "query")
                             
@@ -252,12 +263,41 @@ class NLPService {
                     }
                 }
                 
-                // Extract JSON from the response
+                // Extract JSON from the response - using more robust method
+                // First try to find JSON in code blocks
+                const codeBlockRegex = /```(?:json)?\s*([\s\S]*?)\s*```/g;
+                let codeBlockMatches = Array.from(responseText.matchAll(codeBlockRegex));
+                
+                for (const codeMatch of codeBlockMatches) {
+                    if (codeMatch && codeMatch[1]) {
+                        try {
+                            return JSON.parse(codeMatch[1].trim());
+                        } catch (e) {
+                            console.warn('Failed to parse JSON from code block, continuing to next strategy');
+                        }
+                    }
+                }
+                
+                // Then try to find any JSON object with { }
                 const jsonStart = responseText.indexOf('{');
                 const jsonEnd = responseText.lastIndexOf('}') + 1;
                 if (jsonStart >= 0 && jsonEnd > jsonStart) {
                     const jsonStr = responseText.substring(jsonStart, jsonEnd);
-                    return JSON.parse(jsonStr);
+                    try {
+                        return JSON.parse(jsonStr);
+                    } catch (e) {
+                        console.warn('Failed to parse JSON directly, attempting to fix malformed JSON');
+                        // Try to fix common issues like unquoted or single-quoted property names
+                        const fixedJson = jsonStr
+                            .replace(/([{,]\s*)(['"])?([a-zA-Z0-9_]+)(['"])?\s*:/g, '$1"$3":')
+                            .replace(/:\s*'([^']*)'/g, ':"$1"')
+                            .replace(/,(\s*[}\]])/g, '$1');
+                        try {
+                            return JSON.parse(fixedJson);
+                        } catch (fixError) {
+                            console.error('Failed to parse fixed JSON in intent detection');
+                        }
+                    }
                 }
                 
                 // Fallback to regex detection if no valid JSON
@@ -273,11 +313,16 @@ class NLPService {
      * Fallback intent detection using regex patterns
      */
     private detectIntentWithRegex(input: string): {
-        intent: 'create' | 'update' | 'delete' | 'query';
+        intent: 'create' | 'update' | 'delete' | 'query' | 'confirm';
         confidence: number;
         queryType?: 'availability' | 'event_details';
     } {
         const text = input.toLowerCase();
+        
+        // Check for confirmation patterns first
+        if (/^\s*(yes|yeah|yep|sure|ok|okay|correct|right|sounds good|that works)\s*$/i.test(text)) {
+            return { intent: 'confirm', confidence: 0.95 };
+        }
         
         // Query patterns have highest precedence
         if (/\b(check|show|find|list|what|when|where|do i have|is there|availability)\b/i.test(text)) {
@@ -812,8 +857,15 @@ class NLPService {
                         // Validate the final date is not in the past
                         const now = new Date();
                         if (parsedResponse.startTime < now) {
-                            console.warn('Adjusted date is in the past, moving to next year');
-                            parsedResponse.startTime.setFullYear(parsedResponse.startTime.getFullYear() + 1);
+                            console.warn('Adjusted date is in the past, moving to current or future year');
+                            const currentYear = now.getFullYear();
+                            // Set to current year first
+                            parsedResponse.startTime.setFullYear(currentYear);
+                            // If still in the past, move to next year
+                            if (parsedResponse.startTime < now) {
+                                parsedResponse.startTime.setFullYear(currentYear + 1);
+                            }
+                            console.log(`Date adjusted to: ${parsedResponse.startTime.toString()}`);
                         }
 
                         // Add confidence adjustments based on date specificity
@@ -1623,6 +1675,24 @@ class NLPService {
                     console.warn(`TIME SHIFT DETECTED: Adjusting incorrectly shifted time from ${parsedHour}:00 to ${correctedHour}:00`);
                     // Set to the corrected hour
                     date.setHours(correctedHour);
+                }
+            }
+            
+            // FIX FOR "TODAY" ISSUE:
+            // Check if originalText contains "today" but date is set to tomorrow
+            if (originalText && originalText.toLowerCase().includes('today')) {
+                const today = new Date();
+                if (date.getDate() === today.getDate() + 1 && 
+                    date.getMonth() === today.getMonth() && 
+                    date.getFullYear() === today.getFullYear()) {
+                    console.warn('TODAY DETECTION: Text contains "today" but date was set to tomorrow');
+                    // Fix the date while preserving the time
+                    const hours = date.getHours();
+                    const minutes = date.getMinutes();
+                    date.setDate(today.getDate());
+                    date.setHours(hours);
+                    date.setMinutes(minutes);
+                    console.log('Corrected date for "today":', date.toString());
                 }
             }
             

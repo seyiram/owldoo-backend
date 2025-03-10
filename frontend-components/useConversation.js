@@ -49,12 +49,17 @@ const useConversation = ({ onSendMessage }) => {
       if (response) {
         // Update conversation and thread IDs
         if (response.conversationId) {
+          console.log('Setting conversationId:', response.conversationId);
           setConversationId(response.conversationId);
         }
         
         if (response.threadId) {
+          console.log('Setting threadId:', response.threadId);
           setThreadId(response.threadId);
         }
+        
+        // Log full response for debugging
+        console.log('Full response from sendMessage:', response);
         
         // Add bot message to the list
         const botMessage = {

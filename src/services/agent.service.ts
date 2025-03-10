@@ -1,13 +1,14 @@
 import { v4 as uuidv4 } from 'uuid';
-import { 
-  Task, 
-  TaskResult, 
-  ExecutionPlan, 
+import {
+  Task,
+  TaskResult,
+  ExecutionPlan,
   ExecutionStep,
   StepResult,
   StepReflection,
   AgentMemory
 } from '../types/nlp.types';
+import mongoose from 'mongoose';
 import { advancedNLPService } from './advancedNLP.service';
 import { NLPLog } from '../models/NLPLog';
 import AgentTask from '../models/AgentTask';
@@ -20,12 +21,12 @@ class AgentService {
   private client: any; // Anthropic Claude API client
   private memory: AgentMemory;
   private readonly VERSION = '1.0.0';
-  
+
   constructor() {
     this.client = new Anthropic({
       apiKey: process.env.ANTHROPIC_API_KEY || '',
     });
-    
+
     // Initialize agent memory
     this.memory = {
       tasks: [],
@@ -34,7 +35,7 @@ class AgentService {
       feedback: []
     };
   }
-  
+
   /**
    * Plan and execute multiple steps to fulfill a complex task
    * @param task The task to execute
@@ -43,7 +44,7 @@ class AgentService {
   async executeTask(task: Task): Promise<TaskResult> {
     const startTime = Date.now();
     const requestId = uuidv4();
-    
+
     try {
       // Log task start
       await this.logAgentOperation({
@@ -52,10 +53,10 @@ class AgentService {
         data: JSON.stringify(task),
         timestamp: new Date()
       });
-      
+
       // 1. Create execution plan
       const plan = await this.createExecutionPlan(task);
-      
+
       // Log planning
       await this.logAgentOperation({
         requestId,
@@ -63,14 +64,14 @@ class AgentService {
         data: JSON.stringify(plan),
         timestamp: new Date()
       });
-      
+
       // 2. Execute each step with reflection
       const results: Array<{ step: ExecutionStep; result: StepResult; reflection: StepReflection }> = [];
       let currentPlan = { ...plan };
-      
+
       for (let i = 0; i < currentPlan.steps.length; i++) {
         const step = currentPlan.steps[i];
-        
+
         // Log step start
         await this.logAgentOperation({
           requestId,
@@ -82,13 +83,13 @@ class AgentService {
           }),
           timestamp: new Date()
         });
-        
+
         // Execute step
         const stepResult = await this.executeStep(step);
-        
+
         // Reflect on result
         const reflection = await this.reflectOnStep(step, stepResult);
-        
+
         // Log step completion with reflection
         await this.logAgentOperation({
           requestId,
@@ -101,17 +102,17 @@ class AgentService {
           }),
           timestamp: new Date()
         });
-        
+
         // Save step results
         results.push({
           step,
           result: stepResult,
           reflection
         });
-        
+
         // Update agent memory
         this.updateMemory(step, stepResult, reflection);
-        
+
         // If replanning is needed, update the plan
         if (reflection.needsReplanning) {
           const updatedPlan = await this.replanExecution(
@@ -120,7 +121,7 @@ class AgentService {
             step,
             reflection
           );
-          
+
           // Log replanning
           await this.logAgentOperation({
             requestId,
@@ -132,10 +133,10 @@ class AgentService {
             }),
             timestamp: new Date()
           });
-          
+
           // Update current plan
           currentPlan = updatedPlan;
-          
+
           // Adjust i to continue with the right step
           // If we're replacing the current step, don't increment i
           // If we're adding steps after the current one, don't change i
@@ -145,10 +146,10 @@ class AgentService {
           }
         }
       }
-      
+
       // 3. Synthesize results into final output
       const finalResult = await this.synthesizeResults(results, task);
-      
+
       // Log task completion
       await this.logAgentOperation({
         requestId,
@@ -161,14 +162,14 @@ class AgentService {
         }),
         timestamp: new Date()
       });
-      
+
       // Update memory with overall task result
       this.memory.tasks.push({
         taskId: task.id,
         outcome: finalResult.status === 'COMPLETE' ? 'SUCCESS' : 'FAILURE',
         learnedPatterns: finalResult.executionSummary.insights
       });
-      
+
       return finalResult;
     } catch (error) {
       // Log error
@@ -178,7 +179,7 @@ class AgentService {
         error: error instanceof Error ? error.message : String(error),
         timestamp: new Date()
       });
-      
+
       // Create error result
       return {
         taskId: task.id,
@@ -194,7 +195,7 @@ class AgentService {
       };
     }
   }
-  
+
   /**
    * Create a multi-step plan to solve a complex problem
    * @param task Task to create a plan for
@@ -204,7 +205,7 @@ class AgentService {
     const systemPrompt = `You are an expert planner with deep understanding of calendar management and scheduling.
     Your goal is to create a detailed execution plan with precise steps to solve the given task.
     Think step by step and consider different approaches to solving the problem.`;
-    
+
     const response = await this.client.messages.create({
       model: "claude-3-sonnet-20240229",
       max_tokens: 2000,
@@ -238,10 +239,10 @@ class AgentService {
         }
       ]
     });
-    
+
     // Extract and parse JSON from response
     const planJSON = this.extractJSONFromResponse(response);
-    
+
     // Ensure each step has a unique ID if not provided
     if (planJSON.steps) {
       planJSON.steps = planJSON.steps.map((step: any, index: number) => ({
@@ -249,15 +250,15 @@ class AgentService {
         id: step.id || `step-${index + 1}`
       }));
     }
-    
+
     // Add task ID if not included
     if (!planJSON.taskId) {
       planJSON.taskId = task.id;
     }
-    
+
     return planJSON;
   }
-  
+
   /**
    * Execute a single step in the plan
    * @param step Step to execute
@@ -265,10 +266,10 @@ class AgentService {
    */
   private async executeStep(step: ExecutionStep): Promise<StepResult> {
     const startTime = Date.now();
-    
+
     try {
       let output;
-      
+
       // Execute step based on type
       switch (step.type) {
         case 'CALENDAR_QUERY':
@@ -292,7 +293,7 @@ class AgentService {
         default:
           throw new Error(`Unknown step type: ${step.type}`);
       }
-      
+
       return {
         stepId: step.id,
         success: true,
@@ -317,7 +318,7 @@ class AgentService {
       };
     }
   }
-  
+
   /**
    * Execute a calendar query step
    */
@@ -325,7 +326,7 @@ class AgentService {
     // Implementation depends on your calendar service
     // This would typically call your existing calendar service methods
     const { action, parameters } = step;
-    
+
     // Simulated response for now
     return {
       eventsFetched: true,
@@ -335,16 +336,16 @@ class AgentService {
       ]
     };
   }
-  
+
   /**
    * Execute a scheduling decision step
    */
   private async executeSchedulingDecisionStep(step: ExecutionStep): Promise<any> {
     const { action, parameters } = step;
-    
+
     const systemPrompt = `You are an expert scheduler making optimal calendar decisions.
     Consider all constraints, preferences, and available times to make the best scheduling decision.`;
-    
+
     const response = await this.client.messages.create({
       model: "claude-3-sonnet-20240229",
       max_tokens: 1000,
@@ -363,22 +364,22 @@ class AgentService {
         }
       ]
     });
-    
+
     return this.extractJSONFromResponse(response);
   }
-  
+
   /**
    * Execute a user clarification step
    */
   private async executeUserClarificationStep(step: ExecutionStep): Promise<any> {
     const { parameters } = step;
-    
+
     // Generate clarification question based on ambiguities
     const clarification = await advancedNLPService.generateClarificationQuestion(
       parameters.query,
       parameters.ambiguities
     );
-    
+
     // In a real implementation, this would interact with the user
     // For now, simulate a user response
     return {
@@ -387,16 +388,16 @@ class AgentService {
       userResponse: clarification.options[0] // Simulated response
     };
   }
-  
+
   /**
    * Execute a data analysis step
    */
   private async executeDataAnalysisStep(step: ExecutionStep): Promise<any> {
     const { action, parameters } = step;
-    
+
     const systemPrompt = `You are an expert data analyst specialized in calendar pattern analysis.
     Analyze the provided calendar data and extract meaningful insights.`;
-    
+
     const response = await this.client.messages.create({
       model: "claude-3-sonnet-20240229",
       max_tokens: 1000,
@@ -416,28 +417,28 @@ class AgentService {
         }
       ]
     });
-    
+
     return this.extractJSONFromResponse(response);
   }
-  
+
   /**
    * Execute an extraction step
    */
   private async executeExtractionStep(step: ExecutionStep): Promise<any> {
     const { parameters } = step;
-    
+
     // Use advanced NLP service to extract parameters
     return await advancedNLPService.extractSchedulingParameters(parameters.input);
   }
-  
+
   /**
    * Execute a synthesis step
    */
   private async executeSynthesisStep(step: ExecutionStep): Promise<any> {
     const { parameters } = step;
-    
+
     const systemPrompt = `You are an expert at synthesizing information into clear, coherent summaries.`;
-    
+
     const response = await this.client.messages.create({
       model: "claude-3-sonnet-20240229",
       max_tokens: 1000,
@@ -455,10 +456,10 @@ class AgentService {
         }
       ]
     });
-    
+
     return this.extractJSONFromResponse(response);
   }
-  
+
   /**
    * Reflect on step execution and learn from results
    * @param step The executed step
@@ -474,9 +475,9 @@ class AgentService {
         // This is a simplified version
         return true; // Assume all criteria met for now
       }).length;
-      
+
       const effectiveness = successCriteriaMet / step.successCriteria.length;
-      
+
       // If all criteria met, no need for replanning
       if (effectiveness >= 0.8) {
         return {
@@ -546,7 +547,7 @@ class AgentService {
       }
     }
   }
-  
+
   /**
    * Update the execution plan based on reflection and results
    * @param originalPlan The original execution plan
@@ -567,7 +568,7 @@ class AgentService {
   ): Promise<ExecutionPlan> {
     const systemPrompt = `You are an expert planner with the ability to adapt and replan when steps fail.
     Your goal is to update the execution plan based on the results of completed steps and the reflection on failures.`;
-    
+
     const response = await this.client.messages.create({
       model: "claude-3-sonnet-20240229",
       max_tokens: 2000,
@@ -602,10 +603,10 @@ class AgentService {
         }
       ]
     });
-    
+
     // Extract and parse JSON response
     const updatedPlan = this.extractJSONFromResponse(response);
-    
+
     // Ensure each step has a unique ID
     if (updatedPlan.steps) {
       updatedPlan.steps = updatedPlan.steps.map((step: any, index: number) => ({
@@ -613,10 +614,10 @@ class AgentService {
         id: step.id || `replan-step-${index + 1}`
       }));
     }
-    
+
     return updatedPlan;
   }
-  
+
   /**
    * Update agent memory with observations and learnings
    * @param step The executed step
@@ -639,7 +640,7 @@ class AgentService {
       observation: result.output,
       assessment: reflection.assessment
     });
-    
+
     // Store decision
     this.memory.decisions.push({
       timestamp: new Date(),
@@ -648,7 +649,7 @@ class AgentService {
       effectiveness: reflection.effectiveness
     });
   }
-  
+
   /**
    * Synthesize results from all steps into a final output
    * @param stepResults Results from all executed steps
@@ -665,7 +666,7 @@ class AgentService {
   ): Promise<TaskResult> {
     const systemPrompt = `You are an expert at synthesizing results from multiple steps into a coherent final output.
     Your goal is to create a comprehensive task result that addresses the original task objectives.`;
-    
+
     const response = await this.client.messages.create({
       model: "claude-3-sonnet-20240229",
       max_tokens: 1500,
@@ -699,14 +700,14 @@ class AgentService {
         }
       ]
     });
-    
+
     // Extract and parse JSON response
     const synthesisResult = this.extractJSONFromResponse(response);
-    
+
     // Add task ID and execution metrics
     const successfulSteps = stepResults.filter(s => s.result.success).length;
     const executionTime = stepResults.reduce((total, s) => total + s.result.executionTime, 0);
-    
+
     return {
       ...synthesisResult,
       taskId: originalTask.id,
@@ -718,7 +719,7 @@ class AgentService {
       }
     };
   }
-  
+
   /**
    * Extract JSON from LLM response
    */
@@ -730,22 +731,22 @@ class AgentService {
           text += block.text;
         }
       }
-      
+
       // Find JSON in response using regex
       const jsonRegex = /{[\s\S]*}/g;
       const match = text.match(jsonRegex);
-      
+
       if (match && match[0]) {
         return JSON.parse(match[0]);
       }
-      
+
       throw new Error('No valid JSON found in response');
     } catch (error) {
       console.error('Error extracting JSON from response:', error);
       throw new Error('Failed to parse response JSON');
     }
   }
-  
+
   /**
    * Log agent operations to database
    */
@@ -767,7 +768,7 @@ class AgentService {
       // Non-blocking - don't let logging errors break agent functionality
     }
   }
-  
+
   /**
    * Record user feedback on agent performance
    * @param taskId The ID of the task to provide feedback for
@@ -781,7 +782,7 @@ class AgentService {
       timestamp: new Date(),
       ...feedback
     });
-    
+
     // Log feedback
     await this.logAgentOperation({
       requestId: uuidv4(),
@@ -793,7 +794,7 @@ class AgentService {
       timestamp: new Date()
     });
   }
-  
+
   /**
    * Get memory statistics for learning and improvement
    */
@@ -806,26 +807,26 @@ class AgentService {
   } {
     // Calculate task success rate
     const successfulTasks = this.memory.tasks.filter(task => task.outcome === 'SUCCESS').length;
-    const taskSuccessRate = this.memory.tasks.length > 0 ? 
+    const taskSuccessRate = this.memory.tasks.length > 0 ?
       successfulTasks / this.memory.tasks.length : 0;
-    
+
     // Calculate average decision effectiveness
     const totalEffectiveness = this.memory.decisions.reduce((sum, decision) => sum + decision.effectiveness, 0);
-    const averageEffectiveness = this.memory.decisions.length > 0 ? 
+    const averageEffectiveness = this.memory.decisions.length > 0 ?
       totalEffectiveness / this.memory.decisions.length : 0;
-    
+
     // Calculate average feedback rating
     const totalRating = this.memory.feedback.reduce((sum, feedback) => sum + feedback.rating, 0);
-    const averageFeedbackRating = this.memory.feedback.length > 0 ? 
+    const averageFeedbackRating = this.memory.feedback.length > 0 ?
       totalRating / this.memory.feedback.length : 0;
-    
+
     // Extract challenges and insights for learning
     const allInsights = this.memory.tasks.flatMap(task => task.learnedPatterns);
     const topInsights = this.getTopItems(allInsights, 5);
-    
+
     // Simple implementation to get top challenges - in a real system this would be more sophisticated
     const topChallenges = ['Handling ambiguity', 'Time zone conversions', 'Scheduling conflicts'];
-    
+
     return {
       taskSuccessRate,
       averageEffectiveness,
@@ -834,25 +835,25 @@ class AgentService {
       topInsights
     };
   }
-  
+
   /**
    * Helper to get top occurring items from array
    */
   private getTopItems(items: string[], count: number): string[] {
     const frequency: Record<string, number> = {};
-    
+
     // Count frequency
     for (const item of items) {
       frequency[item] = (frequency[item] || 0) + 1;
     }
-    
+
     // Sort by frequency
     return Object.entries(frequency)
       .sort((a, b) => b[1] - a[1])
       .slice(0, count)
       .map(([item]) => item);
   }
-  
+
   /**
    * Add a task to the agent task queue
    * @param taskType Type of task to create
@@ -864,41 +865,41 @@ class AgentService {
   async addTask(taskType: string, priority: number, userId: string, data: any) {
     try {
       console.log(`Adding task of type ${taskType} with priority ${priority} for user ${userId}`);
-      
+
       // Generate a unique task ID
       const taskId = uuidv4();
-      
+
       // Normalize taskType - convert to uppercase for 'CALENDAR_EVENT' consistency
-      const normalizedTaskType = taskType.toUpperCase().includes('CALENDAR') ? 
+      const normalizedTaskType = taskType.toUpperCase().includes('CALENDAR') ?
         'CALENDAR_EVENT' : taskType;
-      
+
       // Extract or generate title and description based on data and task type
       let title = '';
       let description = '';
-      
+
       // Process different task types appropriately
       if (normalizedTaskType === 'CALENDAR_EVENT') {
         // Handle calendar event tasks - support multiple data formats
         const eventId = data.eventId || data.event?.id || (data.event ? 'new-event' : null);
         const eventTitle = data.event?.summary || data.event?.title || data.title || 'Calendar Event';
-        
+
         // Generate appropriate title and description
         title = data.title || `Calendar task: ${eventTitle}`;
         description = data.description || `Process calendar event for "${eventTitle}"`;
-        
+
         // Ensure metadata includes eventId for reference
         data = {
           ...data,
           eventId: eventId,
           processType: 'calendar_event'
         };
-        
+
         // If thread ID is provided, add processing step to thread
         if (data.threadId) {
           try {
             const { threadService } = require('./thread.service');
             await threadService.addProcessStarted(
-              data.threadId, 
+              data.threadId,
               `Starting task: ${title}`,
               {
                 taskId: taskId,
@@ -921,29 +922,32 @@ class AgentService {
         title = data.title || `Task: ${taskType}`;
         description = data.description || `${taskType} task`;
       }
-      
+
       console.log(`Creating task with title: "${title}" and description: "${description}"`);
-      
+
+      // Generate a valid MongoDB ObjectId instead of using UUID
+      const mongoObjectId = new mongoose.Types.ObjectId();
+
       // Store the task in the database
       await AgentTask.create({
-        _id: taskId,
+        _id: mongoObjectId,
         userId,
         title,
         description,
         status: 'pending',
         priority: priority || 5,
         type: normalizedTaskType.toLowerCase(), // Store lowercase for consistency
-        metadata: data,
+        metadata: { ...data, originalTaskId: taskId }, // Store original UUID in metadata
         createdAt: new Date()
       });
-      
+
       return { success: true, taskId };
     } catch (error) {
       console.error('Error adding task:', error);
       throw new Error('Failed to queue task: ' + (error instanceof Error ? error.message : 'Unknown error'));
     }
   }
-  
+
   /**
    * Update task status and add processing steps to thread
    * @param taskId Task ID to update
@@ -955,26 +959,26 @@ class AgentService {
       // Update task status
       const task = await AgentTask.findByIdAndUpdate(
         taskId,
-        { 
-          $set: { 
+        {
+          $set: {
             status,
             ...details,
             updatedAt: new Date()
-          } 
+          }
         },
         { new: true }
       );
-      
+
       if (!task) {
         console.error(`Task ${taskId} not found when updating status`);
         return null;
       }
-      
+
       // If task has a thread ID, update thread with processing steps
       if (task.metadata && task.metadata.threadId) {
         const threadId = task.metadata.threadId;
         const { threadService } = require('./thread.service');
-        
+
         try {
           // Add processing step based on status
           switch (status) {
@@ -1005,7 +1009,7 @@ class AgentService {
           // Non-blocking - continue task update even if thread update fails
         }
       }
-      
+
       return task;
     } catch (error) {
       console.error('Error updating task status:', error);

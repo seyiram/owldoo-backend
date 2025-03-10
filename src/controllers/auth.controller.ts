@@ -16,90 +16,26 @@ export const initiateGoogleAuth = async (req: Request, res: Response) => {
 export const handleGoogleCallback = async (req: Request, res: Response) => {
     try {
         const { code } = req.query;
-        console.log('Received callback with code:', code ? 'Code present' : 'No code');
-        console.log('Full query params:', req.query);
-
+        
         if (!code || typeof code !== 'string') {
             throw new Error('Invalid auth code');
         }
 
-        console.log('Processing auth callback...');
+        // Get Google OAuth tokens and directly use them
         const tokens = await googleCalendarService.handleAuthCallback(code);
-        console.log('Auth successful, tokens received');
+        const userProfile = await googleCalendarService.getUserProfile();
 
-        // Get the origin from the referer or a default value
-        const origin = (req.headers.referer) ?
-            new URL(req.headers.referer).origin :
-            'http://localhost:5173'; // Frontend application origin
-
-        console.log('Using origin for postMessage:', origin);
-
-        // Return HTML that posts a message to the opener window and closes itself
-        res.send(`
-            <html>
-            <body>
-                <script>
-                    console.log("Auth callback page loaded");
-                    try {
-                        if (window.opener) {
-                            console.log("Posting message to opener");
-                            // Safely serialize the tokens
-                            const tokenData = ${JSON.stringify(JSON.stringify(tokens))};
-                            window.opener.postMessage({ 
-                                type: 'CALENDAR_AUTH_SUCCESS', 
-                                tokens: JSON.parse(tokenData)
-                            }, "${origin}");
-                            console.log("Message posted, closing window");
-                            setTimeout(() => window.close(), 1000);
-                        } else {
-                            console.log("No opener window found");
-                            document.body.innerHTML += "<p>No opener window found. Please close this window manually.</p>";
-                        }
-                    } catch (err) {
-                        console.error("Error in callback script:", err);
-                        document.body.innerHTML += "<p>Error: " + err.message + "</p>";
-                    }
-                </script>
-                <p>Authentication successful! This window will close automatically.</p>
-            </body>
-            </html>
-        `);
+        res.json({
+            success: true,
+            user: {
+                id: userProfile.id,
+                email: userProfile.email,
+                name: userProfile.name
+            }
+        });
     } catch (error) {
         console.error('Auth callback error:', error);
-
-        // Get the origin from the referer or a default value
-        const origin = (req.headers.referer) ?
-            new URL(req.headers.referer).origin :
-            'http://localhost:5173'; // Frontend application origin
-
-        res.send(`
-            <html>
-            <body>
-                <script>
-                    console.log("Auth error page loaded");
-                    try {
-                        if (window.opener) {
-                            console.log("Posting error message to opener");
-                            window.opener.postMessage({ 
-                                type: 'CALENDAR_AUTH_ERROR', 
-                                error: 'Authentication failed' 
-                            }, "${origin}");
-                            console.log("Error message posted, closing window");
-                            setTimeout(() => window.close(), 1000);
-                        } else {
-                            console.log("No opener window found");
-                            document.body.innerHTML += "<p>No opener window found. Please close this window manually.</p>";
-                        }
-                    } catch (err) {
-                        console.error("Error in error callback script:", err);
-                        document.body.innerHTML += "<p>Error: " + err.message + "</p>";
-                    }
-                </script>
-                <p>Authentication failed. This window will close automatically.</p>
-                <p>Please check the console for more details.</p>
-            </body>
-            </html>
-        `);
+        res.status(500).json({ error: 'Authentication failed' });
     }
 };
 
