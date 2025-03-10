@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import connectDB from './config/database';
 import router from './routes';
+import calendarRoutes from './routes/calendar.routes';
 // import taskRoutes from './routes/taskRoutes';
 
 const app = express();
@@ -9,7 +10,7 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors({
-  origin: ['http://localhost:5173', 'http://localhost:3000'],
+  origin: ['http://localhost:5173', 'http://localhost:3000', 'http://127.0.0.1:5173', 'http://127.0.0.1:3000'],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   credentials: true,
@@ -31,6 +32,7 @@ app.use((req, res, next) => {
 
 // Routes
 app.use('/api', router);
+app.use('/calendar', calendarRoutes);
 
 // Database connection
 connectDB();

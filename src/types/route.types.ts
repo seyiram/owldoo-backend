@@ -1,9 +1,8 @@
-
 import { Request } from 'express';
 import { IUser } from '../models/User';
 
 export interface AuthenticatedRequest extends Request {
-    user?: IUser;
+    user?: IUser & { userId?: string; id?: string };
 }
 
 export interface CalendarEventQuery {

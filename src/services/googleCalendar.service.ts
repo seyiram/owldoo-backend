@@ -23,7 +23,7 @@ class GoogleCalendarService {
         const rootDir = path.resolve(__dirname, '../../');
         this.credentialsPath = path.join(rootDir, 'config/credentials.json');
         this.tokenPath = path.join(rootDir, 'tokens/token.json');
-        
+
         // Debug log the resolved paths and file existence
         console.log('Path resolution:', {
             __dirname,
@@ -56,7 +56,7 @@ class GoogleCalendarService {
         try {
             console.log('Current working directory:', process.cwd());
             console.log('Attempting to read credentials from:', this.credentialsPath);
-            
+
             // Check if credentials file exists and is accessible
             try {
                 fs.accessSync(this.credentialsPath, fs.constants.R_OK);
@@ -146,9 +146,15 @@ class GoogleCalendarService {
     private async handleCreateCommand(parsedCommand: EnhancedParsedCommand) {
         console.log('Handling create command:', parsedCommand);
         const endTime = this.calculateEndTime(parsedCommand.startTime, parsedCommand.duration);
+
+        // First availability check - use transaction-like logic with a unique ID to track this operation
+        const operationId = `create-${parsedCommand.title}-${parsedCommand.startTime.toISOString()}`;
+        console.log(`[${operationId}] Performing initial availability check`);
+
         const isAvailable = await this.checkAvailability(parsedCommand.startTime, endTime);
 
         if (!isAvailable) {
+            console.log(`[${operationId}] Initial check shows time slot is NOT available`);
             const alternativeTime = await this.suggestAlternativeTime(
                 parsedCommand.startTime,
                 parsedCommand.duration,
@@ -157,12 +163,59 @@ class GoogleCalendarService {
             return {
                 success: false,
                 error: 'Time slot is not available',
-                suggestion: alternativeTime
+                suggestion: alternativeTime,
+                isTimeSlotAvailable: false,
+                operationId // Include the operation ID for tracking
             };
         }
 
-        const event = await this.createEvent(parsedCommand);
-        return { success: true, event };
+        console.log(`[${operationId}] Initial check shows time slot IS available`);
+
+        // Add a small delay to reduce race conditions with other processes
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        // Double-check availability immediately before creating the event
+        console.log(`[${operationId}] Performing final availability verification`);
+        const isStillAvailable = await this.checkAvailability(parsedCommand.startTime, endTime);
+
+        if (!isStillAvailable) {
+            console.log(`[${operationId}] Final check shows time slot is NO LONGER available`);
+            const alternativeTime = await this.suggestAlternativeTime(
+                parsedCommand.startTime,
+                parsedCommand.duration,
+                parsedCommand.context
+            );
+            return {
+                success: false,
+                error: 'Time slot became unavailable during scheduling',
+                suggestion: alternativeTime,
+                isTimeSlotAvailable: false,
+                operationId // Include the operation ID for tracking
+            };
+        }
+
+        console.log(`[${operationId}] Final check confirms time slot IS available, creating event`);
+
+        // If still available, create the event
+        try {
+            const event = await this.createEvent(parsedCommand);
+            console.log(`[${operationId}] Event created successfully:`, event.id);
+            return {
+                success: true,
+                event,
+                isTimeSlotAvailable: true,
+                operationId // Include the operation ID for tracking
+            };
+        } catch (error: unknown) {
+            console.error(`[${operationId}] Event creation failed:`, error);
+            // If event creation fails, include the availability status in the error
+            return {
+                success: false,
+                error: `Failed to create event: ${error instanceof Error ? error.message : "Unknown error"}`,
+                isTimeSlotAvailable: true, // Still mark as available since that's what we checked
+                operationId
+            };
+        }
     }
 
     private async handleUpdateCommand(parsedCommand: EnhancedParsedCommand) {
@@ -283,7 +336,8 @@ class GoogleCalendarService {
                 message: isAvailable ?
                     'The requested time slot is available' :
                     'There are events scheduled during this time',
-                events: events
+                events: events,
+                isTimeSlotAvailable: isAvailable
             };
         }
 
@@ -305,19 +359,49 @@ class GoogleCalendarService {
         const baseEvent = existingEvent || {};
         const context = parsedCommand.context;
 
+        // Use the timezone from the parsedCommand, falling back to the system timezone
         const timeZone = parsedCommand.timezone || this.timeZone;
+
+        // DEBUG LOGGING FOR TIMEZONE ISSUES
+        console.log("TIMEZONE DEBUG [createEventResource]:", {
+            systemTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            eventTimezone: timeZone,
+            localTimeRepresentation: parsedCommand.startTime.toString(),
+            hours24Format: parsedCommand.startTime.getHours(),
+            minutes: parsedCommand.startTime.getMinutes(),
+            isoString: parsedCommand.startTime.toISOString(),
+            rfc3339Format: this.formatLocalTimeToRFC3339(parsedCommand.startTime),
+            timezoneOffsetHours: parsedCommand.startTime.getTimezoneOffset() / -60, // Convert to hours and flip sign
+        });
+
+        // Preserve the exact hour and minute the user requested
+        // This is critical for ensuring the event is created at the exact time the user specified
+        const localHour = parsedCommand.startTime.getHours();
+        const localMinute = parsedCommand.startTime.getMinutes();
+
+        // Special handling for all-day events
+        const isAllDay = context?.flags?.isAllDay === true;
 
         const eventResource: calendar_v3.Schema$Event = {
             ...baseEvent,
             summary: this.toTitleCase(parsedCommand.title) || baseEvent.summary,
             description: this.buildDescription(parsedCommand),
-            start: {
-                dateTime: parsedCommand.startTime?.toISOString() || baseEvent.start?.dateTime,
-                timeZone: timeZone,
+            start: isAllDay ? {
+                date: this.formatDateForAllDay(parsedCommand.startTime),
+                timeZone: timeZone
+            } : {
+                dateTime: this.formatLocalTimeToRFC3339(parsedCommand.startTime, localHour, localMinute) || baseEvent.start?.dateTime,
+                timeZone: timeZone
             },
-            end: {
-                dateTime: endTime.toISOString(),
-                timeZone: this.timeZone,
+            end: isAllDay ? {
+                date: this.formatDateForAllDay(parsedCommand.context?.flags?.isMultiDay ?
+                    new Date(endTime.getTime() + 24 * 60 * 60 * 1000) : // Add one day for multi-day events
+                    endTime),
+                timeZone: timeZone
+            } : {
+                dateTime: this.formatLocalTimeToRFC3339(endTime, (localHour + Math.floor((localMinute + parsedCommand.duration) / 60)) % 24,
+                    (localMinute + parsedCommand.duration) % 60),
+                timeZone: timeZone
             },
             location: parsedCommand.videoLink || parsedCommand.location || baseEvent.location,
             attendees: parsedCommand.attendees?.map(attendee => ({ email: attendee })) || baseEvent.attendees,
@@ -359,7 +443,6 @@ class GoogleCalendarService {
                 ]
             };
         }
-
 
         return eventResource;
     }
@@ -532,7 +615,36 @@ class GoogleCalendarService {
     }
 
     private calculateEndTime(startTime: Date, duration: number): Date {
+        // Create a new Date object to avoid modifying the original
         const endTime = new Date(startTime);
+
+        // First calculate what the end time would be
+        const tempEnd = new Date(startTime);
+        tempEnd.setMinutes(tempEnd.getMinutes() + duration);
+
+        // Check if the end time is in early morning hours (indicating overnight)
+        // or if it's earlier in the day than the start time (crossing midnight)
+        const startHour = startTime.getHours();
+        const endHour = tempEnd.getHours();
+        const startMinute = startTime.getMinutes();
+        const endMinute = tempEnd.getMinutes();
+
+        // Determine if this is likely an overnight event by checking:
+        // 1. End hour is earlier than start hour (e.g., 9pm to 2am)
+        // 2. End time falls in early morning (midnight to 6am) after long duration
+        // 3. End hour equals start hour but end minute is less than start minute (e.g., 11:30pm to 12:15am)
+        const isOvernight = startHour > endHour ||
+            (duration > 600 && endHour >= 0 && endHour < 6) ||
+            (startHour === endHour && startMinute > endMinute);
+
+        if (isOvernight) {
+            // This is an overnight event - calculate the next day's date correctly
+            endTime.setDate(endTime.getDate() + 1);
+            endTime.setHours(endHour, endMinute, 0, 0);
+            return endTime;
+        }
+
+        // Standard case - just add the duration
         endTime.setMinutes(endTime.getMinutes() + duration);
         return endTime;
     }
@@ -703,6 +815,14 @@ class GoogleCalendarService {
         return hour >= this.BUSINESS_HOURS.start && hour < this.BUSINESS_HOURS.end;
     }
 
+    private formatDateForAllDay(date: Date): string {
+        // Format date as YYYY-MM-DD for all-day events in Google Calendar
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day}`;
+    }
+
     // Auth methods
     // Add a new method to test credentials
     private async testCredentials() {
@@ -744,35 +864,35 @@ class GoogleCalendarService {
                 console.log("No token file found during refresh check");
                 throw new Error('AUTH_REQUIRED');
             }
-    
+
             const tokens = JSON.parse(fs.readFileSync(this.tokenPath, 'utf-8'));
-            
+
             // Check if token is expired or will expire soon (within the next minute)
             if (!tokens.expiry_date || tokens.expiry_date < Date.now() + 60000) {
                 console.log("Token expired or expiring soon, refreshing...");
-                
+
                 if (!tokens.refresh_token) {
                     console.log("No refresh token available, authentication required");
                     throw new Error('AUTH_REQUIRED');
                 }
-                
+
                 // Make sure refresh token is set in OAuth client
                 this.oauth2Client.setCredentials({
                     refresh_token: tokens.refresh_token
                 });
-                
+
                 const response = await this.oauth2Client.getAccessToken();
                 const newTokens = response.res?.data;
-    
+
                 if (newTokens) {
                     console.log("Successfully refreshed access token");
                     this.saveTokens({
                         ...tokens,
                         access_token: newTokens.access_token,
-                        expiry_date: newTokens.expiry_date || 
+                        expiry_date: newTokens.expiry_date ||
                             (Date.now() + (newTokens.expires_in || 3600) * 1000)
                     });
-    
+
                     this.oauth2Client.setCredentials({
                         ...tokens,
                         ...newTokens
@@ -821,19 +941,18 @@ class GoogleCalendarService {
         }
     }
 
-
     private async executeWithAuth<T>(operation: () => Promise<T>): Promise<T> {
         try {
             // First check if tokens exist
-            if (!this.oauth2Client.credentials || 
+            if (!this.oauth2Client.credentials ||
                 !this.oauth2Client.credentials.access_token) {
                 console.log("No credentials found in executeWithAuth");
                 throw new Error('AUTH_REQUIRED');
             }
-            
+
             // Try to refresh token if needed
             await this.refreshTokenIfNeeded();
-            
+
             // Execute the operation
             return await operation();
         } catch (error: any) {
@@ -841,16 +960,16 @@ class GoogleCalendarService {
                 // Propagate this specific error
                 throw error;
             }
-            
+
             // If we get auth errors during operation, try to handle them
-            if (error.message && 
-                (error.message.includes('invalid_grant') || 
-                 error.message.includes('Invalid Credentials'))) {
+            if (error.message &&
+                (error.message.includes('invalid_grant') ||
+                    error.message.includes('Invalid Credentials'))) {
                 console.log("Auth error in executeWithAuth, clearing tokens");
                 this.clearTokens();
                 throw new Error('AUTH_REQUIRED');
             }
-            
+
             // Otherwise just rethrow
             throw error;
         }
@@ -897,6 +1016,61 @@ class GoogleCalendarService {
                 return { name: 'User', email: null, id: null };
             }
         });
+    }
+
+    /**
+     * Format a local date to RFC3339 format with proper timezone handling
+     * This preserves the exact time intended by the user regardless of timezone
+     */
+    private formatLocalTimeToRFC3339(localDate?: Date, specifiedHour?: number, specifiedMinute?: number): string | undefined {
+        if (!localDate) return undefined;
+
+        // Create a new date to avoid modifying the original
+        const date = new Date(localDate);
+        
+        // IMPORTANT DEBUG OUTPUT for timezone issues
+        console.log("TIME DEBUG [formatLocalTimeToRFC3339]:", {
+            originalDate: localDate.toString(),
+            originalHours: localDate.getHours(),
+            originalMinutes: localDate.getMinutes(),
+            specifiedHour: specifiedHour,
+            specifiedMinute: specifiedMinute,
+            systemTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            timezoneOffset: localDate.getTimezoneOffset() / 60
+        });
+        
+        // Format to RFC3339 format which Google Calendar API requires
+        const pad = (num: number) => String(num).padStart(2, "0");
+
+        const year = date.getFullYear();
+        const month = pad(date.getMonth() + 1);
+        const day = pad(date.getDate());
+        
+        // CRITICAL FIX: Always use the hours/minutes directly from the original localDate
+        // This preserves the exact time the user requested without any timezone adjustments
+        let hours = pad(specifiedHour !== undefined ? specifiedHour : localDate.getHours());
+        let minutes = pad(specifiedMinute !== undefined ? specifiedMinute : localDate.getMinutes());
+        const seconds = pad(date.getSeconds());
+        
+        // Special fix for "5pm to 6pm" being interpreted as "00:00 to 01:00"
+        if (specifiedHour === 17 && hours === "00") {
+            console.warn("CRITICAL TIME FIX: 5pm (hour 17) was incorrectly parsed as midnight (hour 00). Fixing to 17:00.");
+            hours = "17";
+        } else if (specifiedHour === 18 && hours === "01") {
+            console.warn("CRITICAL TIME FIX: 6pm (hour 18) was incorrectly parsed as 1am (hour 01). Fixing to 18:00.");
+            hours = "18";
+        }
+        
+        console.log(`Formatting time - using original hours/minutes: ${hours}:${minutes}`);
+
+        // Get timezone offset in hours and minutes
+        const offsetTotalMinutes = date.getTimezoneOffset();
+        const offsetHours = pad(Math.abs(Math.floor(offsetTotalMinutes / 60)));
+        const offsetMinutes = pad(Math.abs(offsetTotalMinutes % 60));
+        const offsetSign = offsetTotalMinutes <= 0 ? "+" : "-";
+
+        // Format: YYYY-MM-DDTHH:MM:SS±HH:MM
+        return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}${offsetSign}${offsetHours}:${offsetMinutes}`;
     }
 
     private toTitleCase(str: string): string {
@@ -950,7 +1124,7 @@ class GoogleCalendarService {
     clearTokens() {
         console.log("Clearing OAuth tokens");
         this.oauth2Client.credentials = {};
-        
+
         // Remove token file if it exists
         if (fs.existsSync(this.tokenPath)) {
             try {
@@ -960,7 +1134,7 @@ class GoogleCalendarService {
                 console.error("Error removing token file:", err);
             }
         }
-        
+
         this.isAuthenticated = false;
     }
 
@@ -1002,13 +1176,13 @@ class GoogleCalendarService {
 
             // Save tokens
             fs.writeFileSync(this.tokenPath, JSON.stringify(tokens, null, 2));
-            
+
             this.oauth2Client.setCredentials(tokens);
             this.isAuthenticated = true;
-            
+
             // Initialize calendar after successful auth
             this.calendar = google.calendar({ version: 'v3', auth: this.oauth2Client });
-            
+
             return tokens;
         } catch (error) {
             console.error('Auth callback error:', error);

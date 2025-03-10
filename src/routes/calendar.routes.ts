@@ -8,17 +8,15 @@ const router = express.Router();
 // All routes use auth middleware
 
 // Auth routes
+router.get('/auth/status', authController.getAuthStatus);
 router.get('/auth/url', authController.initiateGoogleAuth);
-
-// Auth status check
-router.get('/auth/status', calendarController.checkAuthStatus);
+router.get('/auth/callback', authController.handleGoogleCallback);
+router.post('/auth/logout', authController.logout);
 
 // User profile
 router.get('/profile', calendarController.getUserProfile);
-// router.get('/auth/callback', authController.handleGoogleCallback);
 
 router.use(authMiddleware);
-
 
 // Command endpoint
 router.post('/command', calendarController.handleCommand);
@@ -26,6 +24,5 @@ router.post('/command', calendarController.handleCommand);
 // Events endpoints
 router.get('/events', calendarController.getEvents);
 router.get('/events/:id', calendarController.getEvent);
-
 
 export default router;

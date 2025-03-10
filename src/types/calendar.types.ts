@@ -75,11 +75,78 @@ export interface TimeDefaults {
 }
 
 export interface Context {
+    // Core scheduling flexibility
     isUrgent: boolean;
     isFlexible: boolean;
     priority: 'low' | 'normal' | 'high';
     timePreference: 'exact' | 'approximate' | 'flexible';
-    isWorkSchedule?: boolean;  // Add this property
+    isWorkSchedule?: boolean;
+    
+    // Enhanced context features
+    eventType?: 'work' | 'personal' | 'meeting' | 'appointment' | 'travel' | 'exercise' | 'meal' | 'deadline' | 'other';
+    importance?: number; // 1-10 scale
+    intentSource?: 'llm' | 'rule-based' | 'user' | string;
+    
+    // Time context
+    timeConstraints?: {
+        earliestStart?: Date;
+        latestStart?: Date;
+        preferredTime?: Date;
+        alternativeTimes?: Date[];
+        mustEnd?: Date;
+        preferredDuration?: number; // minutes
+        minimumDuration?: number; // minutes
+        isWorkHours?: boolean;
+    };
+    
+    // Attendee context
+    attendeeContext?: {
+        required: string[];
+        optional: string[];
+        preferredMeetingTimeForAttendees?: boolean;
+        facilitator?: string;
+    };
+    
+    // User-specific context
+    userState?: {
+        energy?: 'low' | 'medium' | 'high';
+        concentration?: 'focused' | 'distracted';
+        location?: 'home' | 'office' | 'traveling' | 'other';
+        busynessLevel?: 'light' | 'moderate' | 'heavy';
+        preferredDaysForMeetingType?: Record<string, string[]>; 
+    };
+    
+    // Environmental/external context
+    environmentalFactors?: {
+        weather?: 'good' | 'bad';
+        trafficConditions?: 'light' | 'moderate' | 'heavy';
+        specialDay?: boolean;
+    };
+    
+    // Recurrence patterns
+    recurrenceContext?: {
+        isFirstOccurrence?: boolean;
+        hasExceptions?: boolean;
+        modifiesAllFutureOccurrences?: boolean;
+    };
+    
+    // Related events
+    relatedEvents?: {
+        precedingEventId?: string;
+        followingEventId?: string;
+        conflictingEvents?: string[];
+        partOfSeries?: string;
+    };
+    
+    // Special flags
+    flags?: {
+        needsReminder?: boolean;
+        needsPreparation?: boolean;
+        needsTravel?: boolean;
+        isAllDay?: boolean;
+        isMultiDay?: boolean;
+        isOffSiteEvent?: boolean;
+    };
 }
 
 export interface Recurrence {
@@ -121,4 +188,12 @@ export interface EnhancedParsedCommand extends ParsedCommand {
         parsedDay: string;
     };
     videoLink?: string;
+    // Properties needed by chat.controller.ts
+    isTimeSlotAvailable?: boolean;
+    message?: string;
+    error?: string;
+    success?: boolean;
+    created?: boolean;
+    result?: any;
+    suggestion?: Date;
 }

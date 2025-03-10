@@ -30,44 +30,79 @@ class NLPService {
         this.googleCalendarService = googleCalendarService;
     }
 
+    // Structure to store common patterns for backward compatibility
     private readonly MEETING_PATTERNS = {
         withPerson: /(?:meeting|call|appointment|sync)\s+with\s+(\w+)/i,
         timeReference: /(tomorrow|next week|later today)/i,
         moveCommand: /(?:change|move|reschedule)\s+(?:the|my)?\s*(?:date|time)?\s*(?:for|of)?\s*(.+?)\s+to/i,
     }
 
-    private detectEventType(text: string): { 
+    private async detectEventType(text: string): Promise<{ 
         type: 'work' | 'meeting' | 'other',
         isWorkSchedule: boolean 
-    } {
-        const lowerText = text.toLowerCase();
-        
-        // Check for work schedule patterns first
-        const workPatterns = [
-            /\b(schedule|set|plan)\s+work\b/i,
-            /\bwork\s+(schedule|time|hours)\b/i,
-            /\bworking\s+(from|hours)\b/i
-        ];
-
-        const isWorkSchedule = workPatterns.some(pattern => pattern.test(text));
-        if (isWorkSchedule) {
-            return { type: 'work', isWorkSchedule: true };
+    }> {
+        try {
+            // Use Claude to determine event type instead of regex
+            const response = await this.client.messages.create({
+                model: "claude-3-haiku-20240307", // Using a smaller model for faster response
+                max_tokens: 20,
+                temperature: 0,
+                system: "You are an expert at classifying calendar events based on user requests.",
+                messages: [
+                    {
+                        role: "user",
+                        content: `Classify this calendar event text as either "work", "meeting", or "other".
+                        Also determine if it's a work schedule (true or false).
+                        Return only a JSON object with two fields: "type" and "isWorkSchedule".
+                        
+                        Text: "${text}"
+                        `
+                    }
+                ]
+            });
+            
+            const responseText = response.content[0].type === 'text' ? response.content[0].text.trim() : '';
+            
+            // Parse the JSON response
+            try {
+                const jsonStart = responseText.indexOf('{');
+                const jsonEnd = responseText.lastIndexOf('}') + 1;
+                if (jsonStart >= 0 && jsonEnd > jsonStart) {
+                    const jsonStr = responseText.substring(jsonStart, jsonEnd);
+                    const result = JSON.parse(jsonStr);
+                    return {
+                        type: result.type as 'work' | 'meeting' | 'other',
+                        isWorkSchedule: Boolean(result.isWorkSchedule)
+                    };
+                }
+            } catch (parseError) {
+                console.error('Error parsing event type response:', parseError);
+            }
+            
+            // Fallback to simple keyword matching if parsing fails
+            const lowerText = text.toLowerCase();
+            if (lowerText.includes('work') && !lowerText.includes('meeting') && !lowerText.includes('call')) {
+                return { type: 'work', isWorkSchedule: true };
+            } else if (lowerText.includes('meeting') || lowerText.includes('call') || 
+                      lowerText.includes('appointment') || lowerText.includes('sync')) {
+                return { type: 'meeting', isWorkSchedule: false };
+            }
+            
+            return { type: 'other', isWorkSchedule: false };
+        } catch (error) {
+            console.error('Error using LLM for event type detection:', error);
+            
+            // Fallback to simple keyword matching
+            const lowerText = text.toLowerCase();
+            if (lowerText.includes('work') && !lowerText.includes('meeting') && !lowerText.includes('call')) {
+                return { type: 'work', isWorkSchedule: true };
+            } else if (lowerText.includes('meeting') || lowerText.includes('call') || 
+                      lowerText.includes('appointment') || lowerText.includes('sync')) {
+                return { type: 'meeting', isWorkSchedule: false };
+            }
+            
+            return { type: 'other', isWorkSchedule: false };
         }
-
-        // Then check for meeting patterns
-        const meetingPatterns = [
-            /\bmeeting\b/i,
-            /\bcall\b/i,
-            /\bappointment\b/i,
-            /\bsync\b/i
-        ];
-
-        const isMeeting = meetingPatterns.some(pattern => pattern.test(text));
-        if (isMeeting) {
-            return { type: 'meeting', isWorkSchedule: false };
-        }
-
-        return { type: 'other', isWorkSchedule: false };
     }
 
     private async parseUpdateCommand(input: string): Promise<EnhancedParsedCommand> {
@@ -130,75 +165,352 @@ class NLPService {
         return targetEvent ? new Date(targetEvent.start.dateTime) : null;
     }
 
+    /**
+     * Retry mechanism with exponential backoff
+     * @param operation The function to retry
+     * @param maxRetries Maximum number of retries
+     * @param baseDelay Base delay in milliseconds
+     * @returns The result of the operation
+     */
+    private async retry<T>(
+        operation: () => Promise<T>,
+        maxRetries: number = 3,
+        baseDelay: number = 500
+    ): Promise<T> {
+        let lastError: any;
+        
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                return await operation();
+            } catch (error: any) {
+                console.warn(`Attempt ${attempt + 1} failed: ${error.message}`);
+                lastError = error;
+                
+                // If it's not a retryable error, throw immediately
+                if (!(error?.headers?.['x-should-retry'] === 'true' || 
+                      error?.status === 529 || 
+                      error?.status === 429 || 
+                      error?.message?.includes('timeout'))) {
+                    throw error;
+                }
+                
+                // Calculate delay with exponential backoff and jitter
+                const delay = baseDelay * Math.pow(2, attempt) + Math.random() * 200;
+                console.log(`Retrying in ${Math.round(delay)}ms...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+        
+        throw lastError || new Error('All retry attempts failed');
+    }
+
+    /**
+     * First detect the intent type using a lightweight LLM call
+     * @param input User input string
+     * @returns Detected intent type and confidence
+     */
+    private async detectIntentType(input: string): Promise<{
+        intent: 'create' | 'update' | 'delete' | 'query';
+        confidence: number;
+        queryType?: 'availability' | 'event_details';
+    }> {
+        try {
+            return await this.retry(async () => {
+                const response = await this.client.messages.create({
+                    model: "claude-3-haiku-20240307", // Using smaller model for faster response
+                    max_tokens: 50,
+                    temperature: 0,
+                    system: "You detect intent from calendar requests.",
+                    messages: [
+                        {
+                            role: "user",
+                            content: `Analyze this calendar-related request and classify it as one of:
+                            
+                            1. CREATE (schedule, create, set up an event)
+                            2. UPDATE (change, move, reschedule an event)
+                            3. DELETE (cancel, remove an event)
+                            4. QUERY (check, show, list, find events or availability)
+                            
+                            If it's a QUERY, also specify the query type as either:
+                            - 'availability' (checking if a time is free)
+                            - 'event_details' (finding events or details about events)
+                            
+                            Return a JSON object with:
+                            - intent: "create", "update", "delete", or "query"
+                            - confidence: number between 0-1
+                            - queryType: "availability" or "event_details" (only if intent is "query")
+                            
+                            Request: "${input}"`
+                        }
+                    ]
+                });
+                
+                let responseText = '';
+                for (const block of response.content) {
+                    if (block.type === 'text') {
+                        responseText += block.text;
+                    }
+                }
+                
+                // Extract JSON from the response
+                const jsonStart = responseText.indexOf('{');
+                const jsonEnd = responseText.lastIndexOf('}') + 1;
+                if (jsonStart >= 0 && jsonEnd > jsonStart) {
+                    const jsonStr = responseText.substring(jsonStart, jsonEnd);
+                    return JSON.parse(jsonStr);
+                }
+                
+                // Fallback to regex detection if no valid JSON
+                return this.detectIntentWithRegex(input);
+            });
+        } catch (error) {
+            console.error('Error in intent detection:', error);
+            return this.detectIntentWithRegex(input);
+        }
+    }
+    
+    /**
+     * Fallback intent detection using regex patterns
+     */
+    private detectIntentWithRegex(input: string): {
+        intent: 'create' | 'update' | 'delete' | 'query';
+        confidence: number;
+        queryType?: 'availability' | 'event_details';
+    } {
+        const text = input.toLowerCase();
+        
+        // Query patterns have highest precedence
+        if (/\b(check|show|find|list|what|when|where|do i have|is there|availability)\b/i.test(text)) {
+            let queryType: 'availability' | 'event_details' = 'event_details';
+            if (/\b(free|available|busy|open|schedule for|availability)\b/i.test(text)) {
+                queryType = 'availability';
+            }
+            return { intent: 'query', confidence: 0.85, queryType };
+        }
+        
+        // Delete patterns
+        if (/\b(cancel|delete|remove|clear|drop|skip)\b/i.test(text)) {
+            return { intent: 'delete', confidence: 0.8 };
+        }
+        
+        // Update patterns
+        if (/\b(change|move|reschedule|shift|update|postpone|push)\b/i.test(text)) {
+            return { intent: 'update', confidence: 0.8 };
+        }
+        
+        // Create patterns
+        if (/\b(schedule|create|add|set up|book|plan|need|going to|will)\b/i.test(text)) {
+            return { intent: 'create', confidence: 0.75 };
+        }
+        
+        // Default to create with low confidence
+        return { intent: 'create', confidence: 0.5 };
+    }
+
     async parseCommand(input: string, options?: ParseCommandOptions): Promise<EnhancedParsedCommand> {
         try {
+            // First detect intent before proceeding - this is key to our new approach
+            const intentDetection = await this.detectIntentType(input);
+            console.log('Detected intent:', intentDetection);
 
+            // Check for update/reschedule command
             const isUpdateCommand = input.toLowerCase().match(/^(?:let's\s+)?(?:change|move|reschedule)/i);
-
             if (isUpdateCommand) {
                 return this.parseUpdateCommand(input);
             }
 
             // Add debug logging
             console.log('Input:', input);
-            console.log('Has Simple Pattern:', this.hasSimplePattern(input));
-
-            // Check if it's a move command
-            if (this.MEETING_PATTERNS.moveCommand.test(input)) {
-                return this.handleMeetingUpdate(input);
-            }
-
-            if (this.hasSimplePattern(input)) {
-                return this.parseWithRegex(input);
-            }
-
-            const anthroParsedCommand = await this.parseWithAnthropic(input, options);
-
-            // If confidence is low but regex might work better
-            if (anthroParsedCommand.confidence &&
-                anthroParsedCommand.confidence < 0.7 &&
-                this.hasSimplePattern(input)) {
-                const regexParsedCommand = this.parseWithRegex(input);
-                return regexParsedCommand.confidence! > anthroParsedCommand.confidence
-                    ? regexParsedCommand
-                    : anthroParsedCommand;
-            }
-
-            // Extract video conference link
+            
+            // Extract video conference link early to clean the input
             const videoLinkPattern = /(https?:\/\/[^\s]+)/i;
             const videoLinkMatch = input.match(videoLinkPattern);
             const videoLink = videoLinkMatch ? videoLinkMatch[0] : undefined;
-
-            // Remove video link from input
             const cleanedInput = videoLink ? input.replace(videoLinkPattern, '').trim() : input;
-
-            // Parse the cleaned input
-            const finalParsedCommand = await this.parseWithAnthropic(cleanedInput, options);
-
-            if (videoLink) {
-                anthroParsedCommand.videoLink = videoLink;
+            
+            // For query intent with availability, create a specialized response
+            if (intentDetection.intent === 'query' && intentDetection.queryType === 'availability' && intentDetection.confidence > 0.7) {
+                console.log('Handling availability query with specialized handler');
+                // Create a specialized availability query response
+                const availabilityCommand = this.createAvailabilityQueryCommand(input);
+                
+                // Add video link if one was found
+                if (videoLink) {
+                    availabilityCommand.videoLink = videoLink;
+                }
+                
+                return availabilityCommand;
             }
+            
+            // Try LLM parsing with retries
+            try {
+                // Use LLM as primary parser through parseWithAnthropic
+                const parsedCommand = await this.retry(async () => {
+                    return this.parseWithAnthropic(cleanedInput, options);
+                });
+                
+                // Add video link if one was found
+                if (videoLink) {
+                    parsedCommand.videoLink = videoLink;
+                }
+                
+                // Ensure the action matches our intent detection for consistency
+                if (intentDetection.confidence > 0.7) {
+                    parsedCommand.action = intentDetection.intent;
+                    if (intentDetection.intent === 'query' && intentDetection.queryType) {
+                        parsedCommand.queryType = intentDetection.queryType;
+                    }
+                }
+                
+                // Get event type using LLM detection
+                const eventType = await this.detectEventType(input);
+                
+                // Set the appropriate context based on event type, but preserve the original title
+                if (eventType.isWorkSchedule) {
+                    parsedCommand.context = {
+                        ...parsedCommand.context,
+                        isWorkSchedule: true,
+                        isUrgent: false,
+                        isFlexible: false,
+                        priority: 'normal',
+                        timePreference: 'exact'
+                    };
+                    
+                    // Make sure we don't overwrite the title for work-related events
+                    const originalTitle = parsedCommand.title;
+                    if (eventType.type === 'work' && originalTitle !== 'Work') {
+                        console.log(`Preserving original title: ${originalTitle} instead of setting generic 'Work'`);
+                    }
+                }
 
-            const eventType = this.detectEventType(input);
-        
-            // Set the appropriate title and context based on event type
-            if (eventType.isWorkSchedule) {
-                finalParsedCommand.title = 'Work';
-                finalParsedCommand.context = {
-                    ...finalParsedCommand.context,
-                    isWorkSchedule: true,
-                    isUrgent: false,
-                    isFlexible: false,
-                    priority: 'normal',
-                    timePreference: 'exact'
-                };
+                // Check if we should use regex as fallback based on confidence
+                const hasSimplePattern = await this.hasSimplePattern(input);
+                if (parsedCommand.confidence && parsedCommand.confidence < 0.7 && hasSimplePattern) {
+                    console.log('Low confidence in LLM parsing, trying regex fallback');
+                    const regexParsedCommand = this.parseWithRegex(input);
+                    
+                    if (regexParsedCommand.confidence! > parsedCommand.confidence) {
+                        console.log('Using regex parsed command (higher confidence)');
+                        
+                        // Add video link to regex result if found
+                        if (videoLink) {
+                            regexParsedCommand.videoLink = videoLink;
+                        }
+                        
+                        // Apply work schedule context if detected, but preserve the original title
+                        if (eventType.isWorkSchedule) {
+                            regexParsedCommand.context = {
+                                ...regexParsedCommand.context,
+                                isWorkSchedule: true,
+                                isUrgent: false,
+                                isFlexible: false,
+                                priority: 'normal',
+                                timePreference: 'exact'
+                            };
+                        }
+                        
+                        // Ensure regex result has the right intent
+                        if (intentDetection.confidence > 0.7) {
+                            regexParsedCommand.action = intentDetection.intent;
+                            if (intentDetection.intent === 'query' && intentDetection.queryType) {
+                                regexParsedCommand.queryType = intentDetection.queryType;
+                            }
+                        }
+                        
+                        return regexParsedCommand;
+                    }
+                }
+                
+                // If move command detected, use specialized handler
+                if (this.MEETING_PATTERNS.moveCommand.test(input)) {
+                    console.log('Move command detected, using specialized handler');
+                    return this.handleMeetingUpdate(input);
+                }
+
+                return parsedCommand;
+            } catch (llmError) {
+                console.warn('Anthropic API parsing failed, falling back to regex-based parser:', llmError);
+                
+                // If we get here, LLM parsing completely failed, so use regex fallback
+                const regexParsedCommand = this.parseWithRegex(input);
+                
+                // Add video link to regex result if found
+                if (videoLink) {
+                    regexParsedCommand.videoLink = videoLink;
+                }
+                
+                // Ensure regex result has the right intent
+                if (intentDetection.confidence > 0.7) {
+                    regexParsedCommand.action = intentDetection.intent;
+                    if (intentDetection.intent === 'query' && intentDetection.queryType) {
+                        regexParsedCommand.queryType = intentDetection.queryType;
+                    }
+                }
+                
+                return regexParsedCommand;
             }
-
-            return finalParsedCommand;
         } catch (error) {
-            console.warn('Anthropic API failed, falling back to regex-based parser:', error);
-            return this.parseWithRegex(input);
+            console.error('All parsing methods failed:', error);
+            throw new Error('Unable to parse calendar command: ' + 
+                (error instanceof Error ? error.message : 'Unknown error'));
         }
+    }
+    
+    /**
+     * Create a specialized response for availability queries
+     */
+    private createAvailabilityQueryCommand(input: string): EnhancedParsedCommand {
+        // Start with today's date
+        const startTime = new Date();
+        let duration = 120; // Default 2 hours for availability check
+        
+        // Try to extract time period from input
+        if (input.toLowerCase().includes('evening')) {
+            startTime.setHours(18, 0, 0, 0);
+            duration = 240; // 4 hours for evening
+        } else if (input.toLowerCase().includes('morning')) {
+            startTime.setHours(9, 0, 0, 0);
+            duration = 180; // 3 hours for morning
+        } else if (input.toLowerCase().includes('afternoon')) {
+            startTime.setHours(13, 0, 0, 0);
+            duration = 300; // 5 hours for afternoon
+        } else if (input.toLowerCase().includes('today')) {
+            startTime.setHours(9, 0, 0, 0);
+            duration = 540; // 9 hours (full work day)
+        } else if (input.toLowerCase().includes('tomorrow')) {
+            startTime.setDate(startTime.getDate() + 1);
+            startTime.setHours(9, 0, 0, 0);
+            duration = 540; // 9 hours (full work day)
+        }
+        
+        // Create the availability query command
+        return {
+            action: 'query',
+            queryType: 'availability',
+            title: 'Availability Check',
+            startTime: startTime,
+            duration: duration,
+            timeConfidence: 0.9,
+            context: {
+                isUrgent: false,
+                isFlexible: true,
+                priority: 'normal',
+                timePreference: 'approximate'
+            },
+            metadata: {
+                originalText: input,
+                parseTime: new Date(),
+                parserVersion: this.VERSION,
+                confidence: 0.9
+            },
+            ambiguityResolution: {
+                assumedDefaults: [],
+                clarificationNeeded: false,
+                alternativeInterpretations: [],
+                confidenceReasons: ['Intent detection identified availability query'],
+                missingInformation: []
+            }
+        };
     }
 
     async parseWithClarification(input: string): Promise<EnhancedParsedCommand> {
@@ -453,100 +765,122 @@ class NLPService {
             }
 
             try {
-                const parsedResponse = JSON.parse(text);
+                // Extract JSON from the response text using regex
+                const jsonStart = text.indexOf('{');
+                const jsonEnd = text.lastIndexOf('}') + 1;
+                
+                if (jsonStart >= 0 && jsonEnd > jsonStart) {
+                    const jsonStr = text.substring(jsonStart, jsonEnd);
+                    const parsedResponse = JSON.parse(jsonStr);
+                    
+                    console.log('Parsed Response:', parsedResponse);
 
-                console.log('Parsed Response:', parsedResponse);
+                    // Validate the parsed date matches the day of week
+                    if (parsedResponse.startTime) {
+                        const date = new Date(parsedResponse.startTime);
 
-                // Validate the parsed date matches the day of week
-                if (parsedResponse.startTime) {
-                    const date = new Date(parsedResponse.startTime);
+                        // Extract date components from input
+                        const dateInfo = {
+                            hasExplicitYear: !!input.match(/\b\d{4}\b/),
+                            hasExplicitMonth: !!input.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/i),
+                            hasExplicitDay: !!input.match(/\b(\d{1,2})(st|nd|rd|th)?\b/),
+                            hasNext: !!input.match(/\b(next|coming)\b/i),
+                            specifiedDay: input.match(/(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i)?.[1]
+                        };
 
-                    // Extract date components from input
-                    const dateInfo = {
-                        hasExplicitYear: !!input.match(/\b\d{4}\b/),
-                        hasExplicitMonth: !!input.match(/\b(January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/i),
-                        hasExplicitDay: !!input.match(/\b(\d{1,2})(st|nd|rd|th)?\b/),
-                        hasNext: !!input.match(/\b(next|coming)\b/i),
-                        specifiedDay: input.match(/(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)/i)?.[1]
+                        console.log('Date parsing info:', dateInfo);
+
+                        // Validate day of week if specified
+                        if (dateInfo.specifiedDay) {
+                            const actualDay = date.toLocaleDateString('en-US', { weekday: 'long' });
+                            if (!this.validateDateWithDayOfWeek(date, dateInfo.specifiedDay)) {
+                                console.warn(`Day mismatch: specified ${dateInfo.specifiedDay}, but date falls on ${actualDay}`);
+                                throw new Error(`The specified date (${date.toDateString()}) falls on ${actualDay}, not ${dateInfo.specifiedDay}`);
+                            }
+                        }
+
+                        // Determine if we should adjust the date
+                        const shouldAdjustDate = !dateInfo.hasExplicitYear ||
+                            (dateInfo.hasNext && !dateInfo.hasExplicitMonth) ||
+                            (!dateInfo.hasExplicitMonth && !dateInfo.hasExplicitDay);
+
+                        if (shouldAdjustDate && dateInfo.specifiedDay) {
+                            console.log('Adjusting date to next occurrence');
+                            parsedResponse.startTime = this.adjustDateToNextOccurrence(date, dateInfo.specifiedDay);
+                        }
+
+                        // Validate the final date is not in the past
+                        const now = new Date();
+                        if (parsedResponse.startTime < now) {
+                            console.warn('Adjusted date is in the past, moving to next year');
+                            parsedResponse.startTime.setFullYear(parsedResponse.startTime.getFullYear() + 1);
+                        }
+
+                        // Add confidence adjustments based on date specificity
+                        parsedResponse.confidence = this.calculateDateConfidence(dateInfo);
+                    }
+
+                    // Validate required fields
+                    if (!parsedResponse.action || !parsedResponse.title || !parsedResponse.startTime || !parsedResponse.duration) {
+                        throw new Error('Missing required fields in parsed response');
+                    }
+
+                    // Convert string dates to Date objects before creating enhancedResponse
+                    if (typeof parsedResponse.startTime === 'string') {
+                        parsedResponse.startTime = new Date(parsedResponse.startTime);
+                    }
+                    if (typeof parsedResponse.targetTime === 'string') {
+                        parsedResponse.targetTime = new Date(parsedResponse.targetTime);
+                    }
+                    if (parsedResponse.recurrence?.until && typeof parsedResponse.recurrence.until === 'string') {
+                        parsedResponse.recurrence.until = new Date(parsedResponse.recurrence.until);
+                    }
+
+                    // Add metadata
+                    const enhancedResponse: EnhancedParsedCommand = {
+                        ...parsedResponse,
+                        metadata: {
+                            originalText: input,
+                            parseTime: new Date(),
+                            parserVersion: this.VERSION,
+                            confidence: parsedResponse.confidence || 0,
+                            context: options
+                        }
                     };
 
-                    console.log('Date parsing info:', dateInfo);
-
-                    // Validate day of week if specified
-                    if (dateInfo.specifiedDay) {
-                        const actualDay = date.toLocaleDateString('en-US', { weekday: 'long' });
-                        if (!this.validateDateWithDayOfWeek(date, dateInfo.specifiedDay)) {
-                            console.warn(`Day mismatch: specified ${dateInfo.specifiedDay}, but date falls on ${actualDay}`);
-                            throw new Error(`The specified date (${date.toDateString()}) falls on ${actualDay}, not ${dateInfo.specifiedDay}`);
-                        }
+                    // Convert string dates to Date objects and handle timezones
+                    if (enhancedResponse.startTime) {
+                        enhancedResponse.startTime = this.convertToLocalTime(
+                            enhancedResponse.startTime.toISOString(), 
+                            userTimezone,
+                            input // Pass the original input text for better time detection
+                        );
+                    }
+                    if (enhancedResponse.targetTime) {
+                        enhancedResponse.targetTime = this.convertToLocalTime(
+                            enhancedResponse.targetTime.toISOString(), 
+                            userTimezone,
+                            input
+                        );
+                    }
+                    if (enhancedResponse.recurrence?.until) {
+                        enhancedResponse.recurrence.until = this.convertToLocalTime(
+                            enhancedResponse.recurrence.until.toISOString(), 
+                            userTimezone,
+                            input
+                        );
                     }
 
-                    // Determine if we should adjust the date
-                    const shouldAdjustDate = !dateInfo.hasExplicitYear ||
-                        (dateInfo.hasNext && !dateInfo.hasExplicitMonth) ||
-                        (!dateInfo.hasExplicitMonth && !dateInfo.hasExplicitDay);
-
-                    if (shouldAdjustDate && dateInfo.specifiedDay) {
-                        console.log('Adjusting date to next occurrence');
-                        parsedResponse.startTime = this.adjustDateToNextOccurrence(date, dateInfo.specifiedDay);
+                    // Validate the enhanced response structure
+                    if (!this.validateEnhancedParsedCommand(enhancedResponse)) {
+                        throw new Error('Invalid parsed command structure');
                     }
 
-                    // Validate the final date is not in the past
-                    const now = new Date();
-                    if (parsedResponse.startTime < now) {
-                        console.warn('Adjusted date is in the past, moving to next year');
-                        parsedResponse.startTime.setFullYear(parsedResponse.startTime.getFullYear() + 1);
-                    }
-
-                    // Add confidence adjustments based on date specificity
-                    parsedResponse.confidence = this.calculateDateConfidence(dateInfo);
+                    return enhancedResponse;
+                } else {
+                    console.error('Failed to find JSON in Claude response:', text);
+                    throw new Error('No valid JSON found in response');
                 }
-
-                // Validate required fields
-                if (!parsedResponse.action || !parsedResponse.title || !parsedResponse.startTime || !parsedResponse.duration) {
-                    throw new Error('Missing required fields in parsed response');
-                }
-
-                // Convert string dates to Date objects before creating enhancedResponse
-                if (typeof parsedResponse.startTime === 'string') {
-                    parsedResponse.startTime = new Date(parsedResponse.startTime);
-                }
-                if (typeof parsedResponse.targetTime === 'string') {
-                    parsedResponse.targetTime = new Date(parsedResponse.targetTime);
-                }
-                if (parsedResponse.recurrence?.until && typeof parsedResponse.recurrence.until === 'string') {
-                    parsedResponse.recurrence.until = new Date(parsedResponse.recurrence.until);
-                }
-
-                // Add metadata
-                const enhancedResponse: EnhancedParsedCommand = {
-                    ...parsedResponse,
-                    metadata: {
-                        originalText: input,
-                        parseTime: new Date(),
-                        parserVersion: this.VERSION,
-                        confidence: parsedResponse.confidence || 0,
-                        context: options
-                    }
-                };
-
-                // Convert string dates to Date objects and handle timezones
-                if (enhancedResponse.startTime) {
-                    enhancedResponse.startTime = this.convertToLocalTime(enhancedResponse.startTime.toISOString(), userTimezone);
-                }
-                if (enhancedResponse.targetTime) {
-                    enhancedResponse.targetTime = this.convertToLocalTime(enhancedResponse.targetTime.toISOString(), userTimezone);
-                }
-                if (enhancedResponse.recurrence?.until) {
-                    enhancedResponse.recurrence.until = this.convertToLocalTime(enhancedResponse.recurrence.until.toISOString(), userTimezone);
-                }
-
-                // Validate the enhanced response structure
-                if (!this.validateEnhancedParsedCommand(enhancedResponse)) {
-                    throw new Error('Invalid parsed command structure');
-                }
-
-                return enhancedResponse;
             } catch (error) {
                 console.error('Error parsing Anthropic response:', error);
                 throw new Error('Invalid parsed command structure');
@@ -557,15 +891,55 @@ class NLPService {
         }
     }
 
-    private hasSimplePattern(input: string): boolean {
-        const simplePatterns = {
-            create: /schedule|create|add|set up|need to|going to|will be/i,
-            update: /change|move|reschedule|shift|update|postpone|instead of|switch to/i,
-            delete: /cancel|delete|remove|clear|drop|can't make|won't be able|skip/i,
-            time: /at\s+\d{1,2}(?::\d{2})?(?:\s*[ap]m)?|\d{1,2}(?::\d{2})?(?:\s*[ap]m)?\s+on/i
-        };
-
-        return Object.values(simplePatterns).some(pattern => pattern.test(input));
+    private async hasSimplePattern(input: string): Promise<boolean> {
+        try {
+            // First, try LLM-based detection for simple calendar patterns
+            const response = await this.client.messages.create({
+                model: "claude-3-haiku-20240307", // Using smaller model for faster response
+                max_tokens: 20,
+                temperature: 0,
+                system: "You identify if calendar requests contain simple patterns (create, update, delete, or time specifications).",
+                messages: [
+                    {
+                        role: "user",
+                        content: `Does this text contain a simple calendar command pattern (create, update, delete, or time specification)?
+                        Return only "true" or "false".
+                        
+                        Text: "${input}"`
+                    }
+                ]
+            });
+            
+            const responseText = response.content[0].type === 'text' ? response.content[0].text.trim().toLowerCase() : '';
+            if (responseText.includes('true')) {
+                return true;
+            } else if (responseText.includes('false')) {
+                return false;
+            }
+            
+            // Fallback to regex patterns if the response is ambiguous
+            const simplePatterns = {
+                create: /schedule|create|add|set up|need to|going to|will be/i,
+                update: /change|move|reschedule|shift|update|postpone|instead of|switch to/i,
+                delete: /cancel|delete|remove|clear|drop|can't make|won't be able|skip/i,
+                time: /at\s+\d{1,2}(?::\d{2})?(?:\s*[ap]m)?|\d{1,2}(?::\d{2})?(?:\s*[ap]m)?\s+on/i
+            };
+            
+            return Object.values(simplePatterns).some(pattern => pattern.test(input));
+            
+        } catch (error) {
+            console.error('Error using LLM for pattern detection:', error);
+            
+            // Fallback to regex in case of LLM failure
+            const simplePatterns = {
+                create: /schedule|create|add|set up|need to|going to|will be/i,
+                update: /change|move|reschedule|shift|update|postpone|instead of|switch to/i,
+                delete: /cancel|delete|remove|clear|drop|can't make|won't be able|skip/i,
+                time: /at\s+\d{1,2}(?::\d{2})?(?:\s*[ap]m)?|\d{1,2}(?::\d{2})?(?:\s*[ap]m)?\s+on/i
+            };
+            
+            return Object.values(simplePatterns).some(pattern => pattern.test(input));
+        }
     }
 
     private parseWithRegex(input: string): EnhancedParsedCommand {
@@ -833,8 +1207,24 @@ class NLPService {
         const timeRangePattern = /(?:from\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)?\s+(?:to|until|till|-)\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)?/i;
         const timeMatch = input.match(timeRangePattern);
 
+        // DEBUG: Print detail about time range matching
+        console.log('DEBUG: Time range matching:', {
+            input,
+            isMatch: !!timeMatch,
+            matches: timeMatch ? timeMatch : 'No match'
+        });
+
         if (timeMatch) {
             const [_, startHour, startMin, startAmPm, endHour, endMin, endAmPm] = timeMatch;
+            
+            console.log('DEBUG: Extracted time range:', {
+                startHour, 
+                startMin, 
+                startAmPm, 
+                endHour, 
+                endMin, 
+                endAmPm
+            });
 
             // Parse start time
             let hours = parseInt(startHour);
@@ -876,23 +1266,45 @@ class NLPService {
             }
         }
 
-        // Specific time pattern
+        // Debug the original input
+        console.log(`DEBUG: parseDateTime input: "${input}"`);
+
+        // Specific time pattern with "at" prefix
         const specificTimePattern = /at\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)?/i;
         const specificTimeMatch = input.match(specificTimePattern);
 
-        if (specificTimeMatch) {
-            let [fullMatch, hourStr, minuteStr, ampm] = specificTimeMatch;
+        // Additional pattern for standalone time like "3pm" (without "at" prefix)
+        const standaloneTimePattern = /\b(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b/i;
+        const standaloneTimeMatch = !specificTimeMatch ? input.match(standaloneTimePattern) : null;
+
+        // Process whichever pattern matched
+        if (specificTimeMatch || standaloneTimeMatch) {
+            const match = specificTimeMatch || standaloneTimeMatch;
+            const matchArray = match as RegExpMatchArray;
+            let [fullMatch, hourStr, minuteStr, ampm] = matchArray;
             let hour = parseInt(hourStr);
             let minute = minuteStr ? parseInt(minuteStr) : 0;
-
+            
+            // Debug the extracted values
+            console.log(`DEBUG: Time matching - original input: "${input}"`);
+            console.log(`DEBUG: Matched pattern: "${fullMatch}"`);
+            console.log(`DEBUG: Extracted time parts - hour: ${hour}, minute: ${minute}, ampm: "${ampm}"`);
+            
+            // Apply AM/PM logic
             if (ampm?.toLowerCase() === 'pm' && hour < 12) {
                 hour += 12;
+                console.log(`DEBUG: PM detected, adjusted hour to: ${hour}`);
             } else if (ampm?.toLowerCase() === 'am' && hour === 12) {
                 hour = 0;
+                console.log(`DEBUG: 12am (midnight) detected, adjusted hour to: ${hour}`);
             }
-
+            
+            // Set the time
             startTime.setHours(hour, minute, 0, 0);
             timeConfidence = 0.95;
+            
+            // Debug the final time
+            console.log(`DEBUG: Final parsed time: ${startTime.toLocaleTimeString()} (${hour}:${minute.toString().padStart(2, '0')})`);
         }
 
         return {
@@ -927,14 +1339,146 @@ class NLPService {
     }
 
     private determineContext(input: string, patterns: Record<string, RegExp>): Context {
+        // Analyze basic context parameters
         const context: Context = {
             isUrgent: /urgent|asap|immediately|right away/i.test(input),
             isFlexible: /flexible|anytime|whenever/i.test(input),
-            priority: /high priority|important|critical/i.test(input) ? 'high' : 'normal',
-            timePreference: /exactly|sharp|on the dot/i.test(input) ? 'exact' : 'approximate'
+            priority: this.determinePriority(input),
+            timePreference: this.determineTimePreference(input),
+            isWorkSchedule: this.isWorkSchedule(input),
+            eventType: this.determineEventType(input),
+            importance: this.determineImportance(input)
+        };
+
+        // Add time constraints if detected
+        const timeConstraints = this.extractTimeConstraints(input);
+        if (Object.keys(timeConstraints).length > 0) {
+            context.timeConstraints = timeConstraints;
+        }
+
+        // Add special flags
+        context.flags = {
+            needsReminder: /\b(remind|remember|don't forget)\b/i.test(input),
+            needsPreparation: /\b(prepare|presentation|materials|bring|prep)\b/i.test(input),
+            needsTravel: /\b(travel|commute|drive|offsite)\b/i.test(input),
+            isAllDay: /\b(all day|all-day)\b/i.test(input),
+            isMultiDay: /\b(multi[- ]day|several days|few days)\b/i.test(input)
         };
 
         return context;
+    }
+
+    private determinePriority(input: string): 'low' | 'normal' | 'high' {
+        if (/\b(high priority|important|critical|crucial|urgent|top|highest)\b/i.test(input)) {
+            return 'high';
+        }
+        if (/\b(low priority|not important|whenever|no rush|low|optional)\b/i.test(input)) {
+            return 'low';
+        }
+        return 'normal';
+    }
+
+    private determineTimePreference(input: string): 'exact' | 'approximate' | 'flexible' {
+        if (/\b(exactly|sharp|on the dot|precise)\b/i.test(input)) {
+            return 'exact';
+        }
+        if (/\b(flexible|whenever|any time|when convenient)\b/i.test(input)) {
+            return 'flexible';
+        }
+        return 'approximate';
+    }
+
+    private isWorkSchedule(input: string): boolean {
+        return /\b(work schedule|working hours|office hours)\b/i.test(input) || 
+              (/\b(work|office)\b/i.test(input) && !/\b(meeting|call)\b/i.test(input));
+    }
+
+    private determineEventType(input: string): Context['eventType'] {
+        const text = input.toLowerCase();
+        
+        // Check for work schedule patterns
+        if (/\b(work|job|office|shift)\b/.test(text) && !/\b(meeting|call)\b/.test(text)) {
+            return 'work';
+        }
+        
+        // Check for meeting patterns
+        if (/\b(meet|meeting|call|sync|appointment|interview)\b/.test(text)) {
+            return 'meeting';
+        }
+        
+        // Check for travel patterns
+        if (/\b(travel|trip|flight|journey|commute)\b/.test(text)) {
+            return 'travel';
+        }
+        
+        // Check for exercise patterns
+        if (/\b(exercise|workout|gym|training|fitness)\b/.test(text)) {
+            return 'exercise';
+        }
+        
+        // Check for meal patterns
+        if (/\b(lunch|dinner|breakfast|meal|food)\b/.test(text)) {
+            return 'meal';
+        }
+        
+        // Check for deadline patterns
+        if (/\b(deadline|due|by|submit|complete)\b/.test(text)) {
+            return 'deadline';
+        }
+        
+        // Check for appointment patterns
+        if (/\b(doctor|dentist|appointment|visit)\b/.test(text)) {
+            return 'appointment';
+        }
+        
+        // Default to personal
+        return 'personal';
+    }
+
+    private determineImportance(input: string): number {
+        let importance = 5; // Default medium importance
+        
+        // Adjust based on keywords
+        if (/\b(critical|crucial|urgent|highest priority)\b/i.test(input)) importance += 3;
+        else if (/\b(important|high priority)\b/i.test(input)) importance += 2;
+        else if (/\b(significant|priority)\b/i.test(input)) importance += 1;
+        else if (/\b(low priority|not important|whenever|no rush)\b/i.test(input)) importance -= 2;
+        else if (/\b(optional|if possible)\b/i.test(input)) importance -= 1;
+        
+        // Adjust based on exclamation marks (enthusiasm)
+        const exclamationCount = (input.match(/!/g) || []).length;
+        importance += Math.min(2, exclamationCount);
+        
+        // Cap at 1-10 range
+        return Math.max(1, Math.min(10, importance));
+    }
+
+    private extractTimeConstraints(input: string): Partial<NonNullable<Context['timeConstraints']>> {
+        const constraints: Partial<NonNullable<Context['timeConstraints']>> = {};
+        
+        // Check for preferred duration
+        const durationMatch = input.match(/\b(?:for|lasting|duration of)\s+(\d+)\s*(?:hour|hr|hours|min|mins|minutes)\b/i);
+        if (durationMatch) {
+            const value = parseInt(durationMatch[1], 10);
+            const unit = durationMatch[0].toLowerCase();
+            constraints.preferredDuration = unit.includes('hour') ? value * 60 : value;
+        }
+        
+        // Check for earliest/latest time constraints
+        if (/\b(?:no earlier than|after|starting from)\s+(\d{1,2}(?::\d{2})?(?:\s*[ap]m)?)\b/i.test(input)) {
+            constraints.earliestStart = new Date(); // This would be properly parsed in a real implementation
+        }
+        
+        if (/\b(?:no later than|before|ending by|by)\s+(\d{1,2}(?::\d{2})?(?:\s*[ap]m)?)\b/i.test(input)) {
+            constraints.latestStart = new Date(); // This would be properly parsed in a real implementation
+        }
+        
+        // Check if event should be during work hours
+        if (/\b(?:during work hours|during office hours|during business hours)\b/i.test(input)) {
+            constraints.isWorkHours = true;
+        }
+        
+        return constraints;
     }
 
     private parseRecurrence(input: string, patterns: Record<string, RegExp>): Recurrence | undefined {
@@ -1012,22 +1556,83 @@ class NLPService {
         };
     }
 
-    private convertToLocalTime(isoString: string, timezone: string): Date {
-        // Create a date object in the target timezone
-        const targetDate = new Date(isoString);
-
-        // Get the UTC timestamp
-        const utcTimestamp = targetDate.getTime();
-
-        // Get the target timezone offset in minutes
-        const targetOffset = new Date(targetDate.toLocaleString('en-US', { timeZone: timezone })).getTimezoneOffset();
-
-        // Get the local timezone offset in minutes
-        const localOffset = targetDate.getTimezoneOffset();
-
-        // Calculate the difference and adjust the time
-        const offsetDiff = localOffset - targetOffset;
-        return new Date(utcTimestamp + (offsetDiff * 60000));
+    private convertToLocalTime(isoString: string, timezone: string, originalText?: string): Date {
+        try {
+            // Parse the ISO string to get a Date object
+            const date = new Date(isoString);
+            
+            // Log the conversion for debugging
+            console.log('DEBUG: convertToLocalTime:', {
+                input: isoString,
+                parsedDate: date.toString(),
+                localString: date.toLocaleString(),
+                hours: date.getHours(),
+                minutes: date.getMinutes(),
+                userTimezone: timezone,
+                systemTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                offset: date.getTimezoneOffset() / 60,
+                originalText: originalText
+            });
+            
+            // For debugging purposes, add explicit warning if the hours appear to be shifted
+            if (date.getHours() !== new Date(date).getHours()) {
+                console.warn('WARNING: Hour mismatch detected in timezone conversion!');
+            }
+            
+            // CRITICAL FIX: Check if the time was incorrectly shifted by 6 hours
+            // This happens when the ISO string comes from a time that was interpreted as UTC
+            // but we need to preserve the local time (e.g., "4pm" should stay "4pm")
+            // Look for a common pattern: input mentions time like "4pm" but date is "10pm"
+            const parsedHour = date.getHours();
+            
+            // Extract the original hour from the ISO string to compare
+            const isoTimeMatch = isoString.match(/T(\d{2}):/);
+            if (isoTimeMatch) {
+                const isoHour = parseInt(isoTimeMatch[1]);
+                
+                // Check for time patterns in the original text if available
+                let textHour: number | undefined = undefined;
+                if (originalText) {
+                    const amPmMatch = originalText.match(/(\d{1,2})\s*(am|pm)/i);
+                    if (amPmMatch) {
+                        let hour = parseInt(amPmMatch[1]);
+                        const ampm = amPmMatch[2].toLowerCase();
+                        
+                        // Convert to 24-hour format
+                        if (ampm === 'pm' && hour < 12) hour += 12;
+                        if (ampm === 'am' && hour === 12) hour = 0;
+                        
+                        textHour = hour;
+                        console.log(`Found time in originalText: ${hour}${ampm} => ${textHour}:00`);
+                    }
+                }
+                
+                // Check for common time shifts (either 6-hour difference for many timezones)
+                // or check for specific scenarios like 5pm (17:00) becoming midnight (00:00)
+                // or look for time mentions in the original ISO string
+                if (parsedHour - isoHour === 6 || isoHour - parsedHour === 18 ||
+                   (isoHour === 17 && parsedHour === 0) || // 5pm -> midnight
+                   (isoHour === 18 && parsedHour === 1) || // 6pm -> 1am
+                   (isoString.includes('T17:') && parsedHour === 0) || // Check for "17:" in ISO string
+                   (isoString.includes('T18:') && parsedHour === 1) || // Check for "18:" in ISO string
+                   (textHour !== undefined && parsedHour !== textHour)) { // Check against time in original text
+                    
+                    // Use textHour from original text if available, otherwise use isoHour
+                    const correctedHour = textHour !== undefined ? textHour : isoHour;
+                    
+                    console.warn(`TIME SHIFT DETECTED: Adjusting incorrectly shifted time from ${parsedHour}:00 to ${correctedHour}:00`);
+                    // Set to the corrected hour
+                    date.setHours(correctedHour);
+                }
+            }
+            
+            // Important: We want to preserve the local time exactly as specified by the user
+            // This is essential for scheduling at specific times like "3pm"
+            return date;
+        } catch (error) {
+            console.error('Error in timezone conversion:', error);
+            return new Date(isoString);
+        }
     }
 
     private validateEnhancedParsedCommand(command: EnhancedParsedCommand): boolean {

@@ -1,4 +1,3 @@
-
 export { default as User } from './User';
 export { default as EventCache } from './EventCache';
 export { default as ErrorLogs } from './ErrorLogs';
@@ -7,3 +6,10 @@ export { default as NLPLog } from './NLPLog';
 export { default as SmartSuggestions } from './SmartSuggestions';
 export { default as UserPreferences } from './UserPreferences';
 export { default as Thread } from './Thread';
+export { default as Conversation } from './Conversation';
+export { default as Suggestion } from './Suggestion';
+export { default as Insight } from './Insight';
+export { default as AgentTask } from './AgentTask';
+export { default as Feedback } from './Feedback';
+export { default as SchedulingModel } from './SchedulingModel';
+export { default as SchedulingFeedback } from './SchedulingFeedback';
