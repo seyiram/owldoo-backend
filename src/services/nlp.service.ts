@@ -1255,7 +1255,8 @@ class NLPService {
             timeConfidence += 0.1; // Increase confidence when timezone is specified
         }
 
-        // Improved time range pattern
+        // Improved time range pattern that better handles times without AM/PM indicators
+        // This pattern specifically looks for cases like "3:30 to 4pm" where only the end time has AM/PM
         const timeRangePattern = /(?:from\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)?\s+(?:to|until|till|-)\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)?/i;
         const timeMatch = input.match(timeRangePattern);
 
@@ -1281,12 +1282,46 @@ class NLPService {
             // Parse start time
             let hours = parseInt(startHour);
             let minutes = startMin ? parseInt(startMin) : 0;
-
-            // Handle AM/PM for start time
+            
+            // Parse end time first to handle cases like "3:30 to 4pm"
+            let endHours = 0;
+            let endMinutes = 0;
+            let endIsPm = false;
+            
+            if (endHour) {
+                endHours = parseInt(endHour);
+                endMinutes = endMin ? parseInt(endMin) : 0;
+                
+                // Check if end time is PM
+                endIsPm = endAmPm?.toLowerCase() === 'pm';
+                
+                // Handle AM/PM for end time
+                if (endIsPm && endHours < 12) {
+                    endHours += 12;
+                } else if (endAmPm?.toLowerCase() === 'am' && endHours === 12) {
+                    endHours = 0;
+                }
+            }
+            
+            // Handle AM/PM for start time with special case for time ranges
             if (startAmPm?.toLowerCase() === 'pm' && hours < 12) {
+                // Explicit PM
                 hours += 12;
             } else if (startAmPm?.toLowerCase() === 'am' && hours === 12) {
+                // Explicit AM
                 hours = 0;
+            } else if (!startAmPm && endAmPm && endHour) {
+                // Start time has no AM/PM indicator but end time does
+                // Apply the same AM/PM context from end time
+                console.log(`DEBUG: Applying AM/PM context from end time to start time`);
+                
+                if (endIsPm && hours < 12) {
+                    // If end time is PM, make start time PM too if it makes sense
+                    console.log(`DEBUG: Assuming start time ${hours}:${minutes} is also PM`);
+                    hours += 12;
+                } else if (endAmPm?.toLowerCase() === 'am' && hours === 12) {
+                    hours = 0;
+                }
             }
 
             startTime.setHours(hours, minutes, 0, 0);
@@ -1294,19 +1329,14 @@ class NLPService {
 
             // Calculate duration if end time is provided
             if (endHour) {
-                let endHours = parseInt(endHour);
-                let endMinutes = endMin ? parseInt(endMin) : 0;
+                // End time hour/minute already processed above
 
-                // Handle AM/PM for end time
-                if (endAmPm?.toLowerCase() === 'pm' && endHours < 12) {
-                    endHours += 12;
-                } else if (endAmPm?.toLowerCase() === 'am' && endHours === 12) {
-                    endHours = 0;
-                }
-
-                // Create end time date
+                // Create end time date and use the pre-processed values
                 const endTimeDate = new Date(startTime);
                 endTimeDate.setHours(endHours, endMinutes);
+                
+                console.log(`DEBUG: End time calculated: ${endTimeDate.toString()} (${endHours}:${endMinutes})`);
+                console.log(`DEBUG: Start time: ${startTime.toString()} (${hours}:${minutes})`);
 
                 // If end time is earlier than start time, assume it's next day
                 if (endTimeDate < startTime) {
@@ -1608,6 +1638,7 @@ class NLPService {
         };
     }
 
+    // Fix time parsing issues when original text contains explicit time references
     private convertToLocalTime(isoString: string, timezone: string, originalText?: string): Date {
         try {
             // Parse the ISO string to get a Date object
@@ -1626,6 +1657,79 @@ class NLPService {
                 originalText: originalText
             });
             
+            // Check if there's a specific time in the original text and fix time shifting issues
+            if (originalText) {
+                // Look for time pattern in format 8pm, 8:30pm, etc.
+                const timeRegex = /(\d{1,2})(?::(\d{1,2}))?\s*([ap]m)/gi;
+                const timeMatches = [...originalText.matchAll(timeRegex)];
+                
+                // Get all matches and their positions
+                const validTimeMatches = timeMatches.filter((match, index) => {
+                    // Check if this time is part of a larger time (e.g., "30pm" in "1:30pm")
+                    const matchStart = match.index || 0;
+                    const matchText = match[0];
+                    
+                    // Check if this time is part of another match
+                    for (let i = 0; i < timeMatches.length; i++) {
+                        if (i === index) continue; // Skip comparing with itself
+                        
+                        const otherMatch = timeMatches[i];
+                        const otherStart = otherMatch.index || 0;
+                        const otherEnd = otherStart + otherMatch[0].length;
+                        
+                        // If this match falls within another match, it's probably part of it
+                        if (matchStart >= otherStart && matchStart < otherEnd) {
+                            console.log(`Ignoring likely minutes match: ${matchText} is part of a time with minutes`);
+                            return false;
+                        }
+                    }
+                    return true;
+                });
+                
+                // If we have a valid match, process it
+                if (validTimeMatches.length > 0) {
+                    // Use the first valid time match (the earliest one in the string)
+                    const timeMatch = validTimeMatches[0];
+                    const [fullMatch, hourStr, minuteStr, ampm] = timeMatch;
+                    let originalHour = parseInt(hourStr);
+                    let originalMinute = minuteStr ? parseInt(minuteStr) : 0;
+                    
+                    console.log(`Found time in originalText: ${fullMatch} => ${originalHour}:${originalMinute}`);
+                    
+                    // Convert to 24-hour format
+                    if (ampm?.toLowerCase() === 'pm' && originalHour < 12) {
+                        originalHour += 12;
+                    } else if (ampm?.toLowerCase() === 'am' && originalHour === 12) {
+                        originalHour = 0;
+                    }
+                    
+                    // Check if original text has a time range pattern like "3:30 to 4pm"
+                    const timeRangePattern = /(\d{1,2})(?::(\d{2}))?\s*([ap]m)?\s+(?:to|until|till|-)\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)?/i;
+                    const hasTimeRange = timeRangePattern.test(originalText);
+                    
+                    // Only do time shift detection if this is not part of a time range
+                    // This prevents standalone "4pm" from overriding the start time in "3:30 to 4pm"
+                    if (!hasTimeRange) {
+                        // Check if there's a significant time difference with what was parsed
+                        const currentHour = date.getHours();
+                        const currentMinute = date.getMinutes();
+                        
+                        if (Math.abs(currentHour - originalHour) > 0) {
+                            console.log(`TIME SHIFT DETECTED: Adjusting incorrectly shifted time from ${currentHour}:${currentMinute} to ${originalHour}:${originalMinute}`);
+                            
+                            // Create a new date with the correct time but keep the date part
+                            const correctedDate = new Date(date);
+                            correctedDate.setHours(originalHour, originalMinute, 0, 0);
+                            
+                            console.log(`Corrected date: ${correctedDate.toString()}`);
+                            return correctedDate;
+                        }
+                    } else {
+                        console.log(`Skipping time shift detection for time range: "${originalText}"`);
+                    }
+                }
+            }
+            
             // For debugging purposes, add explicit warning if the hours appear to be shifted
             if (date.getHours() !== new Date(date).getHours()) {
                 console.warn('WARNING: Hour mismatch detected in timezone conversion!');
@@ -1634,7 +1738,27 @@ class NLPService {
             // CRITICAL FIX: Check if the time was incorrectly shifted by 6 hours
             // This happens when the ISO string comes from a time that was interpreted as UTC
             // but we need to preserve the local time (e.g., "4pm" should stay "4pm")
-            // Look for a common pattern: input mentions time like "4pm" but date is "10pm"
+            const hours = date.getHours();
+            if (hours < 12 && originalText && /\d+\s*pm/i.test(originalText)) {
+                console.log('CRITICAL TIME SHIFT DETECTED: Time appears to be AM but user requested PM');
+                const correctedDate = new Date(date);
+                correctedDate.setHours(hours + 12, date.getMinutes(), 0, 0);
+                console.log(`Time shifted correction: ${hours}:${date.getMinutes()} -> ${hours+12}:${date.getMinutes()}`);
+                return correctedDate;
+            }
+            
+            // Also check for the opposite case - should be PM but appears as AM
+            if (hours >= 12 && originalText && /\d+\s*am/i.test(originalText) && !/12\s*am/i.test(originalText)) {
+                console.log('CRITICAL TIME SHIFT DETECTED: Time appears to be PM but user requested AM');
+                const correctedDate = new Date(date);
+                correctedDate.setHours(hours - 12, date.getMinutes(), 0, 0);
+                console.log(`Time shifted correction: ${hours}:${date.getMinutes()} -> ${hours-12}:${date.getMinutes()}`);
+                return correctedDate;
+            }
+            
+            // CRITICAL FIX: Check if the time was incorrectly shifted by timezone conversion
+            // This happens when the ISO string comes from a time that was interpreted differently
+            // but we need to preserve the local time (e.g., "8pm" should be "8pm" not "2am")
             const parsedHour = date.getHours();
             
             // Extract the original hour from the ISO string to compare
@@ -1645,36 +1769,72 @@ class NLPService {
                 // Check for time patterns in the original text if available
                 let textHour: number | undefined = undefined;
                 if (originalText) {
-                    const amPmMatch = originalText.match(/(\d{1,2})\s*(am|pm)/i);
-                    if (amPmMatch) {
+                    // First check if there's a time with minutes (like 1:30pm) to avoid double-matching
+                    const timeWithMinutesPattern = /(\d{1,2}):(\d{1,2})\s*(am|pm)/i;
+                    const hasTimeWithMinutes = originalText.match(timeWithMinutesPattern);
+
+                    // Only look for standalone hour patterns if there's no time with minutes
+                    // OR if we want to match both patterns, check that we don't match the minutes part of a time
+                    const standaloneHoursPattern = /\b(\d{1,2})\s*(am|pm)\b/i;
+                    const amPmMatch = originalText.match(standaloneHoursPattern);
+                    
+                    // Skip processing if we found a match but it's part of a time with minutes
+                    let skipMatch = false;
+                    if (amPmMatch && hasTimeWithMinutes) {
+                        // Check if the matched "Xpm" is actually the minutes part of a time with minutes
+                        const matchedHour = parseInt(amPmMatch[1]);
+                        if (matchedHour > 12) {
+                            // This is likely the minutes part of a time with minutes (e.g., "30pm" from "1:30pm")
+                            console.log(`Ignoring likely minutes match: ${amPmMatch[0]} is part of a time with minutes`);
+                            skipMatch = true;
+                        } else if (hasTimeWithMinutes[0].includes(amPmMatch[0])) {
+                            // The match is contained within a time with minutes, so skip it
+                            console.log(`Ignoring duplicate match: ${amPmMatch[0]} is part of ${hasTimeWithMinutes[0]}`);
+                            skipMatch = true;
+                        }
+                    }
+                    
+                    if (amPmMatch && !skipMatch) {
                         let hour = parseInt(amPmMatch[1]);
                         const ampm = amPmMatch[2].toLowerCase();
                         
                         // Convert to 24-hour format
-                        if (ampm === 'pm' && hour < 12) hour += 12;
-                        if (ampm === 'am' && hour === 12) hour = 0;
+                        if (ampm === 'pm' && hour < 12) {
+                            hour += 12;
+                        } else if (ampm === 'am' && hour === 12) {
+                            hour = 0;
+                        }
                         
                         textHour = hour;
-                        console.log(`Found time in originalText: ${hour}${ampm} => ${textHour}:00`);
+                        console.log(`Found time in originalText: ${amPmMatch[1]}${ampm} => ${textHour}:00`);
                     }
                 }
                 
-                // Check for common time shifts (either 6-hour difference for many timezones)
-                // or check for specific scenarios like 5pm (17:00) becoming midnight (00:00)
-                // or look for time mentions in the original ISO string
-                if (parsedHour - isoHour === 6 || isoHour - parsedHour === 18 ||
-                   (isoHour === 17 && parsedHour === 0) || // 5pm -> midnight
-                   (isoHour === 18 && parsedHour === 1) || // 6pm -> 1am
-                   (isoString.includes('T17:') && parsedHour === 0) || // Check for "17:" in ISO string
-                   (isoString.includes('T18:') && parsedHour === 1) || // Check for "18:" in ISO string
-                   (textHour !== undefined && parsedHour !== textHour)) { // Check against time in original text
-                    
-                    // Use textHour from original text if available, otherwise use isoHour
-                    const correctedHour = textHour !== undefined ? textHour : isoHour;
-                    
-                    console.warn(`TIME SHIFT DETECTED: Adjusting incorrectly shifted time from ${parsedHour}:00 to ${correctedHour}:00`);
-                    // Set to the corrected hour
-                    date.setHours(correctedHour);
+                // First check if this is a time range case - we want to skip time shift detection for those
+                const timeRangePattern = /(\d{1,2})(?::(\d{2}))?\s*([ap]m)?\s+(?:to|until|till|-)\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)?/i;
+                const hasTimeRange = originalText ? timeRangePattern.test(originalText) : false;
+                
+                // Only perform time shift detection if this is not part of a time range expression
+                if (!hasTimeRange) {
+                    // Check for common time shifts (either 6-hour difference for many timezones)
+                    // or check for specific scenarios like 5pm (17:00) becoming midnight (00:00)
+                    // or look for time mentions in the original ISO string
+                    if (parsedHour - isoHour === 6 || isoHour - parsedHour === 18 ||
+                      (isoHour === 17 && parsedHour === 0) || // 5pm -> midnight
+                      (isoHour === 18 && parsedHour === 1) || // 6pm -> 1am
+                      (isoString.includes('T17:') && parsedHour === 0) || // Check for "17:" in ISO string
+                      (isoString.includes('T18:') && parsedHour === 1) || // Check for "18:" in ISO string
+                      (textHour !== undefined && parsedHour !== textHour)) { // Check against time in original text
+                        
+                        // Use textHour from original text if available, otherwise use isoHour
+                        const correctedHour = textHour !== undefined ? textHour : isoHour;
+                        
+                        console.warn(`TIME SHIFT DETECTED: Adjusting incorrectly shifted time from ${parsedHour}:00 to ${correctedHour}:00`);
+                        // Set to the corrected hour
+                        date.setHours(correctedHour);
+                    }
+                } else {
+                    console.log(`Skipping time shift detection for time range: "${originalText}"`);
                 }
             }
             
@@ -2018,8 +2178,6 @@ class NLPService {
         return Math.min(Math.max(confidence, 0), 1);
     }
 
-    // Add to NLPService class
-
     async generateContextualResponse(input: string, options?: ParseCommandOptions): Promise<string> {
         try {
             // Get user context
@@ -2112,10 +2270,8 @@ class NLPService {
     }
 
     /**
-     * 
-     *StreamResponse method for streaming response from Claude
+     * StreamResponse method for streaming response from Claude
      */
-
     async streamResponse(input: string, options?: ParseCommandOptions): Promise<AsyncIterable<string>> {
         try {
             // Get user context

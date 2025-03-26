@@ -106,7 +106,7 @@ export const addMessage = async (req: AuthenticatedRequest, res: Response) => {
             try {
                 // Import and use the Google Calendar service to execute the command
                 const googleCalendarService = require('../services/googleCalendar.service').default;
-                console.log('Executing calendar command:', parsedCommand.action);
+                console.log('Executing Calendar command:', parsedCommand.action);
                 
                 // Log detailed information about the event times for debugging
                 if (parsedCommand.action === 'create') {
@@ -195,19 +195,48 @@ export const addMessage = async (req: AuthenticatedRequest, res: Response) => {
 // Get all threads for a user
 export const getThreads = async (req: AuthenticatedRequest, res: Response) => {
     try {
-
         if (!req.user) {
             return res.status(401).json({ error: 'Authentication required' });
         }
 
         const userId = req.user.id;
+        console.log(`Getting threads for user ${userId}`);
+        
+        // Get all threads for the user sorted by creation date
         const threads = await Thread.find({ userId }).sort({ createdAt: -1 });
-        res.json(threads);
+        console.log(`Found ${threads.length} threads:`, threads.map(t => t._id));
+        
+        // Log thread IDs with and without conversationId for debugging
+        const threadsWithConversation = threads.filter(t => t.conversationId);
+        const threadsWithoutConversation = threads.filter(t => !t.conversationId);
+        console.log(`Threads with conversationId: ${threadsWithConversation.length}`);
+        console.log(`Threads without conversationId: ${threadsWithoutConversation.length}`);
+        
+        // Ensure all threads have required fields for frontend compatibility
+        const normalizedThreads = threads.map(thread => {
+            const threadObj = thread.toObject();
+            // If thread doesn't have conversationId, add a temporary one based on its ID
+            if (!threadObj.conversationId) {
+                threadObj.conversationId = `legacy-${threadObj._id}`;
+                console.log(`Added temporary conversationId to thread ${threadObj._id}`);
+            }
+            // Ensure processingSteps exists to avoid frontend errors
+            if (!threadObj.processingSteps) {
+                threadObj.processingSteps = [];
+            }
+            return threadObj;
+        });
+        
+        // Add CORS headers explicitly to ensure correct cross-origin access
+        res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        
+        res.json(normalizedThreads);
     } catch (error) {
+        console.error('Error in getThreads:', error);
         res.status(500).json({
             error: error instanceof Error ? error.message : 'Failed to fetch threads'
         });
-
     }
 };
 
@@ -221,6 +250,8 @@ export const getThread = async (req: AuthenticatedRequest, res: Response) => {
         const { threadId } = req.params;
         const userId = req.user.id;
 
+        console.log(`Getting thread ${threadId} for user ${userId}`);
+
         // Use the updated thread service to get thread with processing steps
         const { threadService } = require('../services/thread.service');
         const thread = await threadService.getThreadWithProcessing(threadId);
@@ -232,17 +263,31 @@ export const getThread = async (req: AuthenticatedRequest, res: Response) => {
         // Log thread contents for debugging
         console.log(`Retrieved thread ${threadId} with ${thread.messages.length} messages`);
         if (thread.messages.length > 0) {
-            console.log('First user message:', thread.messages.find((m: any) => m.sender === 'user')?.content);
+            console.log('First user message:', thread.messages.find((m: { sender: string }) => m.sender === 'user')?.content);
         }
         
-        // Log processing steps if present
-        if (thread.processingSteps && thread.processingSteps.length > 0) {
-            console.log(`Thread has ${thread.processingSteps.length} processing steps`);
+        // Log all thread properties for debugging
+        console.log('Thread properties:', Object.keys(thread._doc || thread));
+        
+        // Convert to plain object for modification
+        const threadObj = thread.toObject ? thread.toObject() : { ...thread };
+        
+        // Add conversationId if missing (for older threads)
+        if (!threadObj.conversationId) {
+            threadObj.conversationId = `legacy-${threadObj._id}`;
+            console.log(`Added temporary conversationId to thread ${threadObj._id}`);
+        }
+        
+        // Handle processing steps field and log if present
+        if (!threadObj.processingSteps || !Array.isArray(threadObj.processingSteps)) {
+            console.log('Thread has no processing steps or invalid format');
+            // Initialize empty array to avoid frontend errors
+            threadObj.processingSteps = [];
         } else {
-            console.log('Thread has no processing steps');
+            console.log(`Thread has ${threadObj.processingSteps.length} processing steps`);
         }
 
-        res.json(thread);
+        res.json(threadObj);
     } catch (error) {
         console.error('Error getting thread:', error);
         res.status(500).json({

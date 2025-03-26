@@ -1,5 +1,5 @@
 export interface ParsedCommand {
-    action: 'create' | 'update' | 'delete' | 'query';
+    action: 'create' | 'update' | 'delete' | 'query' | 'confirm';
     title: string;
     startTime: Date;
     duration: number; // in minutes

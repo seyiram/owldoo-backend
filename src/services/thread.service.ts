@@ -98,6 +98,14 @@ class ThreadService {
         return null;
       }
       
+      // Handle both field names for processing steps
+      // This ensures the frontend gets the right field regardless of which one is in the database
+      if (!thread.processingSteps) {
+        // Initialize an empty array if processingSteps doesn't exist
+        console.log(`Thread ${threadId} missing processingSteps field, initializing empty array`);
+        thread.processingSteps = [];
+      }
+      
       return thread;
     } catch (error) {
       console.error('Error getting thread with processing:', error);

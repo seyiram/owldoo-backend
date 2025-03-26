@@ -317,76 +317,118 @@ export const queueTask = async (req: AuthenticatedRequest, res: Response) => {
         const nlpService = require('../services/nlp.service').default;
         const googleCalendarService = require('../services/googleCalendar.service').default;
         
-        // Write parsing step
-        res.write(`data: ${JSON.stringify({
-          message: "Analyzing your request..."
-        })}\n\n`);
+        // CRITICAL FIX: Check if this is a follow-up task for an already created event
+        // by checking for eventId or calendar_event task metadata
+        const isFollowupTask = (
+          (metadata && (metadata.eventId || metadata.eventData || metadata.operationId)) || 
+          (eventId) ||
+          (event && event.id)
+        );
         
-        // Parse the message to extract calendar command
-        const parsedCommand = await nlpService.parseCommand(task, {
-          userId,
-          threadId: metadata?.threadId
-        });
+        let parsedCommand;
         
-        // Write analysis result
-        res.write(`data: ${JSON.stringify({
-          message: "Request parsed successfully",
-          parsedCommand
-        })}\n\n`);
-        
-        // Check if it's a calendar command that can be executed
-        if (parsedCommand.action && 
-            (parsedCommand.action === 'create' || 
-             parsedCommand.action === 'update' || 
-             parsedCommand.action === 'delete' || 
-             parsedCommand.action === 'query')) {
-          
-          // Write executing command step
+        if (isFollowupTask) {
+          // This is a follow-up task for an already created event, not a new calendar request
           res.write(`data: ${JSON.stringify({
-            message: `Executing ${parsedCommand.action} command...`,
-            action: parsedCommand.action
+            message: "Processing follow-up task for existing calendar event",
+            isFollowupTask: true
           })}\n\n`);
           
-          // Execute the calendar command
-          const calendarResult = await googleCalendarService.handleCommand(parsedCommand);
-          
-          // Write final result
-          if (calendarResult.success) {
-            res.write(`data: ${JSON.stringify({
-              message: calendarResult.message || "Calendar operation successful",
-              result: calendarResult,
-              success: true,
-              created: true
-            })}\n\n`);
-          } else {
-            res.write(`data: ${JSON.stringify({
-              message: calendarResult.error || "Calendar operation failed",
-              result: calendarResult,
-              success: false,
-              suggestion: calendarResult.suggestion
-            })}\n\n`);
-          }
+          // For follow-up tasks, don't re-parse and don't create a new event
+          parsedCommand = null;
         } else {
-          // Write non-calendar command response
+          // This is a new calendar request, proceed with normal parsing
+          // Write parsing step
           res.write(`data: ${JSON.stringify({
-            message: "Request was not a calendar command",
-            parsedCommand,
-            success: false
+            message: "Analyzing your request..."
           })}\n\n`);
+          
+          // Parse the message to extract calendar command
+          parsedCommand = await nlpService.parseCommand(task, {
+            userId,
+            threadId: metadata?.threadId
+          });
         }
         
+        // For follow-up tasks, we skip the whole calendar event creation process
+        if (isFollowupTask) {
+          res.write(`data: ${JSON.stringify({
+            message: "Follow-up task processing complete",
+            success: true,
+            isFollowupTask: true
+          })}\n\n`);
+        } else {
+          // Only for new calendar requests
+          // Write analysis result
+          res.write(`data: ${JSON.stringify({
+            message: "Request parsed successfully",
+            parsedCommand
+          })}\n\n`);
+          
+          // Check if it's a calendar command that can be executed
+          if (parsedCommand && parsedCommand.action && 
+              (parsedCommand.action === 'create' || 
+               parsedCommand.action === 'update' || 
+               parsedCommand.action === 'delete' || 
+               parsedCommand.action === 'query')) {
+            
+            // Write executing command step
+            res.write(`data: ${JSON.stringify({
+              message: `Executing ${parsedCommand.action} command...`,
+              action: parsedCommand.action
+            })}\n\n`);
+            
+            // Execute the calendar command
+            const calendarResult = await googleCalendarService.handleCommand(parsedCommand);
+            
+            // Write final result
+            if (calendarResult.success) {
+              res.write(`data: ${JSON.stringify({
+                message: calendarResult.message || "Calendar operation successful",
+                result: calendarResult,
+                success: true,
+                created: true
+              })}\n\n`);
+            } else {
+              res.write(`data: ${JSON.stringify({
+                message: calendarResult.error || "Calendar operation failed",
+                result: calendarResult,
+                success: false,
+                suggestion: calendarResult.suggestion
+              })}\n\n`);
+            }
+          } else {
+            // Write non-calendar command response
+            res.write(`data: ${JSON.stringify({
+              message: "Request was not a calendar command",
+              parsedCommand,
+              success: false
+            })}\n\n`);
+          }
+        }
+        
+        // Create a task title and description
+        const finalTaskTitle = isFollowupTask ? 
+            (metadata?.eventTitle ? `Follow-up for: ${metadata.eventTitle}` : "Follow-up task") : 
+            (parsedCommand?.title || task);
+        
+        const finalTaskDescription = isFollowupTask ? 
+            `Follow-up processing for calendar event` : 
+            `Processed message: ${task}`;
+            
         // Finally, create the task record for tracking
         const newTask = await AgentTask.create({
           userId,
-          title: parsedCommand.title || task,
-          description: `Processed message: ${task}`,
+          title: finalTaskTitle,
+          description: finalTaskDescription,
           priority: priority || 5,
-          type: 'calendar_event',
+          type: isFollowupTask ? 'calendar_event_followup' : 'calendar_event',
           status: 'completed',
           metadata: {
             ...metadata,
-            parsedCommand,
-            originalMessage: task
+            parsedCommand: isFollowupTask ? null : parsedCommand,
+            originalMessage: task,
+            isFollowupTask: isFollowupTask
           },
           createdAt: new Date()
         });
@@ -420,6 +462,24 @@ export const queueTask = async (req: AuthenticatedRequest, res: Response) => {
     let taskMetadata = metadata || {};
     let taskPriority = priority || 5;
     let taskType = type || 'general';
+    
+    // CRITICAL FIX: Check if this is a follow-up task for an already created event
+    // to prevent duplicate calendar event creation
+    const isFollowupTask = (
+      (metadata && (metadata.eventId || metadata.eventData || metadata.operationId)) || 
+      (eventId) ||
+      (event && event.id)
+    );
+    
+    // For follow-up tasks, make sure we don't reprocess them as new calendar requests
+    if (isFollowupTask) {
+      console.log('Detected follow-up task for existing calendar event - will not reprocess');
+      taskType = 'calendar_event_followup';
+      taskMetadata = {
+        ...taskMetadata,
+        isFollowupTask: true
+      };
+    }
     
     // If task is a string (likely JSON), try to parse it
     if (task && typeof task === 'string') {

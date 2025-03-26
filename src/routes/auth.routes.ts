@@ -3,7 +3,10 @@ import {
     initiateGoogleAuth,
     handleGoogleCallback,
     getAuthStatus,
-    logout
+    logout,
+    refreshToken,
+    setAuthCookies,
+    clearAuthCookies
 } from '../controllers/auth.controller';
 import {
     authenticateUser
@@ -18,8 +21,13 @@ router.get('/google/connect', initiateGoogleAuth);
 router.get('/google/callback', handleGoogleCallback);
 router.post('/logout', logout);
 
+// Add token refresh endpoint
+router.post('/refresh', refreshToken);
+
 // Status check route
 router.get('/status', getAuthStatus);
+router.post('/set-cookies', setAuthCookies);
+router.post('/clear-cookies', clearAuthCookies);
 
 router.use(errorHandler);
 

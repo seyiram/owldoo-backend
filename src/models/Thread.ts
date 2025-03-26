@@ -1,18 +1,19 @@
 import mongoose, { Schema, Document } from 'mongoose';
 import { Message, AgentProcessingStep } from '../types/chat.types';
+
 export interface IThread extends Document {
   messages: Message[];
   createdAt: Date;
   userId?: Schema.Types.ObjectId;
   conversationId?: string; // Reference to Conversation model
-  processingSteps?: AgentProcessingStep[]; // Add processing steps
+  processingSteps?: AgentProcessingStep[]; // Processing steps for tracking
   relatedAgentTasks?: string[]; // References to agent task IDs
 }
 
 const messageSchema = new Schema<Message>({
   sender: {
     type: String,
-    enum: ['user', 'bot'],
+    enum: ['user', 'bot', 'assistant'], // Add 'assistant' to support both naming conventions
     required: true,
   },
   content: {
@@ -20,13 +21,13 @@ const messageSchema = new Schema<Message>({
     required: true,
   },
   timestamp: {
-    type: String,
-    default: () => Date().toString(),
+    type: String, // Using String type but with ISO string format
+    default: () => new Date().toISOString(),
     required: true
   },
 });
 
-// New schema for agent processing steps
+// Schema for agent processing steps
 const processingStepSchema = new Schema({
   stepType: {
     type: String,
@@ -64,7 +65,7 @@ const threadSchema = new Schema<IThread>({
     ref: 'Conversation',
     index: true
   },
-  processingSteps: [processingStepSchema], // Add processing steps array
+  processingSteps: [processingStepSchema], // Processing steps array - ensure this field name is consistent
   relatedAgentTasks: [String] // Array of agent task IDs
 });
 

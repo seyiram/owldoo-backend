@@ -73,8 +73,29 @@ class ConversationService {
           console.log(`[ProcessUserMessage] Existing conversation found with ${conversation.turns.length} turns`);
         }
       } else {
-        console.log(`[ProcessUserMessage] Creating new conversation for user ${userId}`);
-        conversation = await this.getOrCreateConversation(userId);
+        // IMPORTANT FIX: Always create a new conversation when no conversationId is provided
+        // This ensures each new chat creates a new thread
+        console.log(`[ProcessUserMessage] Creating brand new conversation for user ${userId}`);
+        
+        // Create a new conversation with a new UUID
+        conversation = await Conversation.create({
+          userId,
+          conversationId: uuid(),
+          startTime: new Date(),
+          lastActivityTime: new Date(),
+          turns: [],
+          context: {
+            activeEntities: {},
+            referencedEvents: [],
+            goals: [],
+            preferences: await this.getUserPreferences(userId),
+            environmentContext: {
+              timezone: await this.getUserTimezone(userId)
+            }
+          },
+          isActive: true
+        });
+        
         console.log(`[ProcessUserMessage] New conversation created with ID: ${conversation.conversationId}`);
       }
       
@@ -142,12 +163,21 @@ class ConversationService {
           
           console.log('Creating new thread with messages:', messages);
           
-          const newThread = await Thread.create({
-            userId: conversation.userId,
-            messages,
-            createdAt: conversation.startTime,
-            conversationId: conversation.conversationId
-          });
+          let newThread;
+          try {
+            newThread = await Thread.create({
+              userId: conversation.userId,
+              messages,
+              createdAt: conversation.startTime,
+              conversationId: conversation.conversationId,
+              processingSteps: [] // Initialize with empty array
+            });
+            
+            console.log(`Thread created successfully with ID: ${newThread._id}`);
+          } catch (threadError) {
+            console.error('Error creating thread:', threadError);
+            throw new Error('Failed to create thread: ' + (threadError instanceof Error ? threadError.message : 'Unknown error'));
+          }
           
           // Update conversation with thread ID
           conversation.threadId = newThread._id.toString();

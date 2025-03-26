@@ -31,7 +31,12 @@ const UserSchema = new Schema({
     },
     tokenExpiryDate: { 
         type: Date 
+    },
+    lastLogin: {
+        type: Date,
+        default: Date.now
     }
+
 }, { 
     timestamps: true 
 });

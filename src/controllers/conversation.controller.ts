@@ -56,7 +56,7 @@ export const getConversationHistory = async (req: AuthenticatedRequest, res: Res
     const userId = req.user.id;
     
     // Get conversation from database
-    const Conversation = require('mongoose').model('Conversation');
+    const Conversation = mongoose.model('Conversation');
     const conversation = await Conversation.findOne({ 
       conversationId, 
       userId 
@@ -225,7 +225,10 @@ export const getConversationByThread = async (req: AuthenticatedRequest, res: Re
       }
     }
     
-    // Now return the conversation details
+    // Get the thread to include processing steps
+    const thread = await ThreadModel.findById(threadId);
+    
+    // Now return the conversation details with processing steps
     return res.status(200).json({
       id: conversation.conversationId,
       threadId,
@@ -236,7 +239,8 @@ export const getConversationByThread = async (req: AuthenticatedRequest, res: Re
         .filter((turn: any) => turn.action)
         .map((turn: any) => turn.action)) || [],
       createdAt: conversation.createdAt,
-      updatedAt: conversation.updatedAt
+      updatedAt: conversation.updatedAt,
+      processingSteps: thread?.processingSteps || [] // Include processing steps from thread
     });
   } catch (error) {
     console.error('Error getting conversation by thread:', error);
