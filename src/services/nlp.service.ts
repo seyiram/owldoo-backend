@@ -354,9 +354,36 @@ class NLPService {
 
     async parseCommand(input: string, options?: ParseCommandOptions): Promise<EnhancedParsedCommand> {
         try {
+            // Add processing step if threadId is provided
+            if (options?.threadId) {
+                const { threadService } = require('./thread.service');
+                await threadService.addProcessStarted(
+                    options.threadId,
+                    'Processing your command',
+                    {
+                        message: input.substring(0, 100) + (input.length > 100 ? '...' : ''),
+                        timestamp: new Date().toISOString()
+                    }
+                );
+            }
+            
             // First detect intent before proceeding - this is key to our new approach
             const intentDetection = await this.detectIntentType(input);
             console.log('Detected intent:', intentDetection);
+            
+            // Add processing progress step
+            if (options?.threadId) {
+                const { threadService } = require('./thread.service');
+                await threadService.addProcessProgress(
+                    options.threadId,
+                    'Detected intent: ' + intentDetection.intent,
+                    {
+                        intent: intentDetection.intent,
+                        confidence: intentDetection.confidence,
+                        queryType: intentDetection.queryType
+                    }
+                );
+            }
 
             // Check for update/reschedule command
             const isUpdateCommand = input.toLowerCase().match(/^(?:let's\s+)?(?:change|move|reschedule)/i);
@@ -377,11 +404,24 @@ class NLPService {
             if (intentDetection.intent === 'query' && intentDetection.queryType === 'availability' && intentDetection.confidence > 0.7) {
                 console.log('Handling availability query with specialized handler');
                 // Create a specialized availability query response
-                const availabilityCommand = this.createAvailabilityQueryCommand(input);
+                const availabilityCommand = await this.createAvailabilityQueryCommand(input, options);
                 
                 // Add video link if one was found
                 if (videoLink) {
                     availabilityCommand.videoLink = videoLink;
+                }
+                
+                // Add completion step
+                if (options?.threadId) {
+                    const { threadService } = require('./thread.service');
+                    await threadService.addProcessCompleted(
+                        options.threadId,
+                        'Availability query processed',
+                        {
+                            timeframe: availabilityCommand.startTime?.toLocaleString(),
+                            duration: availabilityCommand.duration
+                        }
+                    );
                 }
                 
                 return availabilityCommand;
@@ -462,6 +502,20 @@ class NLPService {
                             }
                         }
                         
+                        // Add completion step for regex parser
+                        if (options?.threadId) {
+                            const { threadService } = require('./thread.service');
+                            await threadService.addProcessCompleted(
+                                options.threadId,
+                                'Command processing completed (regex parser)',
+                                {
+                                    action: regexParsedCommand.action,
+                                    title: regexParsedCommand.title,
+                                    startTime: regexParsedCommand.startTime?.toISOString()
+                                }
+                            );
+                        }
+                        
                         return regexParsedCommand;
                     }
                 }
@@ -469,7 +523,47 @@ class NLPService {
                 // If move command detected, use specialized handler
                 if (this.MEETING_PATTERNS.moveCommand.test(input)) {
                     console.log('Move command detected, using specialized handler');
-                    return this.handleMeetingUpdate(input);
+                    
+                    // Add processing step for move command
+                    if (options?.threadId) {
+                        const { threadService } = require('./thread.service');
+                        await threadService.addProcessProgress(
+                            options.threadId,
+                            'Detected move/reschedule request',
+                            { commandType: 'move' }
+                        );
+                    }
+                    
+                    const result = await this.handleMeetingUpdate(input);
+                    
+                    // Add completion step
+                    if (options?.threadId) {
+                        const { threadService } = require('./thread.service');
+                        await threadService.addProcessCompleted(
+                            options.threadId,
+                            'Move/reschedule processing completed',
+                            {
+                                action: 'update',
+                                title: result.title
+                            }
+                        );
+                    }
+                    
+                    return result;
+                }
+                
+                // Add completion step for standard parser
+                if (options?.threadId) {
+                    const { threadService } = require('./thread.service');
+                    await threadService.addProcessCompleted(
+                        options.threadId,
+                        'Command processing completed',
+                        {
+                            action: parsedCommand.action,
+                            title: parsedCommand.title,
+                            startTime: parsedCommand.startTime?.toISOString()
+                        }
+                    );
                 }
 
                 return parsedCommand;
@@ -477,6 +571,20 @@ class NLPService {
                 console.warn('Anthropic API parsing failed, falling back to regex-based parser:', llmError);
                 
                 // If we get here, LLM parsing completely failed, so use regex fallback
+                
+                // Add processing progress step for fallback
+                if (options?.threadId) {
+                    const { threadService } = require('./thread.service');
+                    await threadService.addProcessProgress(
+                        options.threadId,
+                        'LLM parsing failed, using fallback method',
+                        {
+                            error: llmError instanceof Error ? llmError.message : 'Unknown error',
+                            fallbackParser: 'regex'
+                        }
+                    );
+                }
+                
                 const regexParsedCommand = this.parseWithRegex(input);
                 
                 // Add video link to regex result if found
@@ -492,10 +600,42 @@ class NLPService {
                     }
                 }
                 
+                // Add completion step for fallback parsing
+                if (options?.threadId) {
+                    const { threadService } = require('./thread.service');
+                    await threadService.addProcessCompleted(
+                        options.threadId,
+                        'Command parsing completed (fallback method)',
+                        {
+                            action: regexParsedCommand.action,
+                            title: regexParsedCommand.title,
+                            startTime: regexParsedCommand.startTime?.toISOString()
+                        }
+                    );
+                }
+                
                 return regexParsedCommand;
             }
         } catch (error) {
             console.error('All parsing methods failed:', error);
+            
+            // Add error step for complete failure
+            if (options?.threadId) {
+                const { threadService } = require('./thread.service');
+                try {
+                    await threadService.addProcessError(
+                        options.threadId,
+                        'Failed to parse command',
+                        {
+                            error: error instanceof Error ? error.message : 'Unknown error',
+                            input: input.substring(0, 100) + (input.length > 100 ? '...' : '')
+                        }
+                    );
+                } catch (logError) {
+                    console.error('Error logging processing step:', logError);
+                }
+            }
+            
             throw new Error('Unable to parse calendar command: ' + 
                 (error instanceof Error ? error.message : 'Unknown error'));
         }
@@ -504,7 +644,20 @@ class NLPService {
     /**
      * Create a specialized response for availability queries
      */
-    private createAvailabilityQueryCommand(input: string): EnhancedParsedCommand {
+    private async createAvailabilityQueryCommand(input: string, options?: ParseCommandOptions): Promise<EnhancedParsedCommand> {
+        // Add processing step if threadId is provided
+        if (options?.threadId) {
+            const { threadService } = require('./thread.service');
+            await threadService.addProcessStarted(
+                options.threadId,
+                'Processing availability query',
+                {
+                    queryType: 'availability',
+                    input: input.substring(0, 100) + (input.length > 100 ? '...' : '')
+                }
+            );
+        }
+        
         // Start with today's date
         const startTime = new Date();
         let duration = 120; // Default 2 hours for availability check

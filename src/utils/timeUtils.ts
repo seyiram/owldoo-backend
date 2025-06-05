@@ -5,11 +5,14 @@
 /**
  * Formats a date to a readable string showing date and time
  * @param date Date to format
+ * @param userTimezone Optional user timezone (defaults to system timezone)
  * @returns Formatted date string like "3:00 PM on Thursday, Mar 6"
  */
-export function formatDateTime(date: Date): string {
-  // IMPORTANT: Verify that we're looking at the original requested time
-  // Log extensive details of the date for debugging purposes
+export function formatDateTime(date: Date, userTimezone?: string): string {
+  // Get the user's timezone or use system default
+  const timezone = userTimezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  
+  // IMPORTANT: Log detailed debugging info but don't modify the date
   console.log('FORMAT DATE TIME DEBUG:', {
     input: date.toString(),
     toLocaleString: date.toLocaleString(),
@@ -20,39 +23,41 @@ export function formatDateTime(date: Date): string {
     month: date.getMonth() + 1,
     year: date.getFullYear(),
     currentDay: new Date().getDate(),
-    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    timezoneOffset: date.getTimezoneOffset() / 60
+    timezone: timezone,
+    timezoneOffset: date.getTimezoneOffset() / 60,
+    isDateInFuture: date > new Date()
   });
   
-  // Extract the hour and use it to check for a potential timezone issue
-  const hour = date.getHours();
-  if (hour > 20 && hour <= 23) { // Late night hours that might be wrong
-    console.log('FORMAT DATE TIME: Possible timezone issue detected - hour is in late evening');
+  // Validate the date is in the future or past (just for logging)
+  const now = new Date();
+  const isDateInFuture = date > now;
+  const daysDifference = Math.round((date.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+  
+  if (isDateInFuture) {
+    if (daysDifference < 1) {
+      console.log('DATE VALIDATION: Event is scheduled for TODAY (less than 24 hours ahead)');
+    } else if (daysDifference < 2) {
+      console.log('DATE VALIDATION: Event is correctly scheduled for TOMORROW');
+    } else {
+      console.log(`DATE VALIDATION: Event is scheduled for ${daysDifference} days in the future`);
+    }
+  } else {
+    console.log('DATE VALIDATION: Event is in the past - possible error');
   }
   
-  // Add explicit check to ensure the day is correct - this is important for "today" events
-  const today = new Date();
-  if (date.toDateString().includes('tomorrow') || 
-      (date.getDate() === today.getDate() + 1 && 
-       date.getMonth() === today.getMonth() && 
-       date.getFullYear() === today.getFullYear())) {
-    console.warn('DATE CORRECTION: Event appears to be scheduled for tomorrow instead of today');
-    // Adjust the date back to today while preserving the time
-    date = new Date(date);
-    date.setDate(today.getDate());
-    console.log('Corrected date:', date.toString());
-  }
-  
+  // Format with proper timezone options
   const timeOptions: Intl.DateTimeFormatOptions = { 
     hour: 'numeric', 
     minute: '2-digit', 
-    hour12: true 
+    hour12: true,
+    timeZone: timezone
   };
   
   const dateOptions: Intl.DateTimeFormatOptions = { 
     weekday: 'long', 
     month: 'short', 
-    day: 'numeric'
+    day: 'numeric',
+    timeZone: timezone
   };
   
   const timeString = new Intl.DateTimeFormat('en-US', timeOptions).format(date);

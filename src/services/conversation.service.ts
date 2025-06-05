@@ -109,6 +109,77 @@ class ConversationService {
       conversation.turns.push(userTurn);
       conversation.lastActivityTime = new Date();
       
+      // Move thread creation up before intent processing
+      // Create a thread first thing to ensure it's ready for processing steps
+      try {
+        // Get the original user message
+        const userMessage = message;
+        
+        if (!conversation.threadId) {
+          console.log('Creating new thread for message:', userMessage);
+          
+          // Create a thread in the database with just the current message
+          const Thread = mongoose.model('Thread');
+          const messages = [
+            {
+              sender: 'user',
+              content: message,
+              timestamp: new Date()
+            }
+          ];
+          
+          console.log('Creating new thread with messages:', messages);
+          
+          let newThread;
+          try {
+            newThread = await Thread.create({
+              userId: conversation.userId,
+              messages,
+              createdAt: conversation.startTime,
+              conversationId: conversation.conversationId,
+              processingSteps: [] // Initialize with empty array
+            });
+            
+            console.log(`Thread created successfully with ID: ${newThread._id}`);
+            
+            // Update conversation with thread ID
+            conversation.threadId = newThread._id.toString();
+            await conversation.save();
+            
+            // Verify that thread exists in database before proceeding
+            const verifiedThread = await Thread.findById(newThread._id);
+            if (!verifiedThread) {
+              console.error(`Thread ${newThread._id} verification failed - does not exist in database yet`);
+              await new Promise(resolve => setTimeout(resolve, 300));
+            } else {
+              console.log(`Thread ${newThread._id} verified in database`);
+            }
+            
+            console.log(`Created new thread ${newThread._id} for conversation ${conversation.conversationId}`);
+          } catch (threadError) {
+            console.error('Error creating thread:', threadError);
+            throw new Error('Failed to create thread: ' + (threadError instanceof Error ? threadError.message : 'Unknown error'));
+          }
+        } else {
+          // Add message to existing thread
+          const Thread = mongoose.model('Thread');
+          await Thread.findByIdAndUpdate(
+            conversation.threadId,
+            {
+              $push: {
+                messages: {
+                  sender: 'user',
+                  content: message,
+                  timestamp: new Date()
+                }
+              }
+            }
+          );
+        }
+      } catch (threadError) {
+        console.error('Error managing thread:', threadError);
+      }
+      
       // Process message to understand intent
       const intent = await this.recognizeIntent(message, conversation);
       
@@ -143,65 +214,29 @@ class ConversationService {
       // We've now implemented a proper time verification system in formatActionResponse
       // instead of using specific string replacements
       
-      // Generate a thread in the database if one doesn't exist or validate existing one
+      // Add the assistant's response to the thread
       try {
-        // Get the original user message from this conversation
-        const userMessage = message; // Use the current message instead of searching in turns
-        
-        if (!conversation.threadId) {
-          console.log('Creating new thread for message:', userMessage);
-          
-          // Create a thread in the database with just the current message
-          const Thread = mongoose.model('Thread');
-          const messages = [
-            {
-              sender: 'user',
-              content: message,
-              timestamp: new Date()
-            }
-          ];
-          
-          console.log('Creating new thread with messages:', messages);
-          
-          let newThread;
-          try {
-            newThread = await Thread.create({
-              userId: conversation.userId,
-              messages,
-              createdAt: conversation.startTime,
-              conversationId: conversation.conversationId,
-              processingSteps: [] // Initialize with empty array
-            });
-            
-            console.log(`Thread created successfully with ID: ${newThread._id}`);
-          } catch (threadError) {
-            console.error('Error creating thread:', threadError);
-            throw new Error('Failed to create thread: ' + (threadError instanceof Error ? threadError.message : 'Unknown error'));
-          }
-          
-          // Update conversation with thread ID
-          conversation.threadId = newThread._id.toString();
-          await conversation.save();
-          
-          console.log(`Created new thread ${newThread._id} for conversation ${conversation.conversationId}`);
-        } else {
-          // Add message to existing thread
+        if (conversation.threadId) {
+          // Add assistant message to existing thread
           const Thread = mongoose.model('Thread');
           await Thread.findByIdAndUpdate(
             conversation.threadId,
             {
               $push: {
                 messages: {
-                  sender: 'user',
-                  content: message,
+                  sender: 'assistant',
+                  content: response.content,
                   timestamp: new Date()
                 }
               }
             }
           );
+          console.log('Added assistant response to thread', conversation.threadId);
+        } else {
+          console.error('No thread ID found when trying to add assistant response');
         }
       } catch (threadError) {
-        console.error('Error managing thread:', threadError);
+        console.error('Error adding assistant response to thread:', threadError);
       }
       
       // Define a proper return type that includes conversationId and threadId
@@ -760,16 +795,55 @@ class ConversationService {
   ): Promise<any> {
     // Import googleCalendarService for real queries
     const googleCalendarService = require('./googleCalendar.service').default;
+    // Import threadService for processing steps
+    const { threadService } = require('./thread.service');
     
     try {
       console.log('Handling query intent:', intent);
       
       // Special handling for availability queries
       if (intent.subIntent === 'availability') {
-        const startTime = intent.entities.startTime ? new Date(intent.entities.startTime) : new Date();
-        const endTime = intent.entities.endTime ? new Date(intent.entities.endTime) : new Date(startTime.getTime() + 24 * 60 * 60 * 1000);
+        let startTime = intent.entities.startTime ? new Date(intent.entities.startTime) : new Date();
+        let endTime = intent.entities.endTime ? new Date(intent.entities.endTime) : new Date(startTime.getTime() + 24 * 60 * 60 * 1000);
+        
+        // Ensure consistent time ranges for specific periods like "afternoon", "morning", etc.
+        const originalText = intent.originalText?.toLowerCase() || '';
+        
+        if (originalText.includes('afternoon')) {
+          // Define afternoon as 12pm - 6pm on the requested date
+          startTime.setHours(12, 0, 0, 0);
+          endTime = new Date(startTime);
+          endTime.setHours(18, 0, 0, 0);
+          console.log('Adjusted time range for afternoon:', startTime, 'to', endTime);
+        } else if (originalText.includes('morning')) {
+          // Define morning as 8am - 12pm
+          startTime.setHours(8, 0, 0, 0);
+          endTime = new Date(startTime);
+          endTime.setHours(12, 0, 0, 0);
+          console.log('Adjusted time range for morning:', startTime, 'to', endTime);
+        } else if (originalText.includes('evening')) {
+          // Define evening as 6pm - 10pm
+          startTime.setHours(18, 0, 0, 0);
+          endTime = new Date(startTime);
+          endTime.setHours(22, 0, 0, 0);
+          console.log('Adjusted time range for evening:', startTime, 'to', endTime);
+        }
         
         console.log('Checking availability between:', startTime, 'and', endTime);
+        
+        // Add processing step STARTED if we have a threadId
+        if (conversation.threadId) {
+          await threadService.addProcessStarted(
+            conversation.threadId,
+            'Checking calendar availability',
+            {
+              startTime: startTime.toISOString(),
+              endTime: endTime.toISOString(),
+              duration: Math.round((endTime.getTime() - startTime.getTime()) / (1000 * 60)),
+              query: 'availability'
+            }
+          );
+        }
         
         // Use the proper query command with availability subtype
         const availabilityCommand = {
@@ -779,6 +853,17 @@ class ConversationService {
           duration: Math.round((endTime.getTime() - startTime.getTime()) / (1000 * 60)),
           title: 'Availability Check'
         };
+        
+        // Add processing step PROGRESS
+        if (conversation.threadId) {
+          await threadService.addProcessProgress(
+            conversation.threadId,
+            'Retrieving calendar events',
+            {
+              command: availabilityCommand
+            }
+          );
+        }
         
         // Call the Google Calendar service to check availability properly
         const availabilityResult = await googleCalendarService.handleCommand(availabilityCommand);
@@ -803,6 +888,46 @@ class ConversationService {
         // Create availability message
         const timeRangeText = formatTimeRange(startTime, endTime);
         const isAvailable = availabilityResult.isTimeSlotAvailable === true;
+        
+        // Add processing step COMPLETED based on availability with more user-friendly details
+        if (conversation.threadId) {
+          if (isAvailable) {
+            await threadService.addProcessCompleted(
+              conversation.threadId,
+              'Availability check completed',
+              {
+                isAvailable: true,
+                timeSlot: timeRangeText,
+                queryTime: `${startTime.toLocaleDateString()} at ${startTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}`,
+                eventCount: 0,
+                message: `You're available ${timeRangeText}. No events scheduled during this time.`,
+                humanReadable: `You're available on ${startTime.toLocaleDateString()} at ${startTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}`
+              }
+            );
+          } else {
+            const events = availabilityResult.events || [];
+            
+            // Format event summaries for a more user-friendly output
+            const eventSummaries = events.map((event: any) => ({
+              title: event.summary,
+              time: new Date(event.start.dateTime).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})
+            }));
+            
+            await threadService.addProcessCompleted(
+              conversation.threadId,
+              'Availability check completed',
+              {
+                isAvailable: false,
+                timeSlot: timeRangeText,
+                queryTime: `${startTime.toLocaleDateString()} at ${startTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}`,
+                eventCount: events.length,
+                events: eventSummaries,
+                message: `You have ${events.length} event${events.length > 1 ? 's' : ''} scheduled during this time.`,
+                humanReadable: `You have ${events.length} event${events.length > 1 ? 's' : ''} scheduled on ${startTime.toLocaleDateString()} at ${startTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}`
+              }
+            );
+          }
+        }
         
         if (isAvailable) {
           return {
@@ -847,6 +972,19 @@ class ConversationService {
       }
       
       // Regular event queries (non-availability)
+      // Add processing step STARTED for general queries
+      if (conversation.threadId) {
+        await threadService.addProcessStarted(
+          conversation.threadId,
+          `Processing ${intent.subIntent || 'event'} query`,
+          {
+            queryType: intent.subIntent || 'events',
+            startTime: intent.entities.startTime,
+            duration: intent.entities.duration
+          }
+        );
+      }
+      
       const parsedCommand = {
         action: 'query',
         queryType: intent.subIntent || 'events',
@@ -857,6 +995,17 @@ class ConversationService {
       
       console.log('Querying calendar events from intent:', parsedCommand);
       
+      // Add processing step PROGRESS
+      if (conversation.threadId) {
+        await threadService.addProcessProgress(
+          conversation.threadId,
+          'Fetching calendar events',
+          {
+            command: parsedCommand
+          }
+        );
+      }
+      
       // Call the Google Calendar service to query events
       const result = await googleCalendarService.handleCommand(parsedCommand);
       
@@ -865,6 +1014,20 @@ class ConversationService {
       
       if (result.success) {
         console.log('Calendar events queried successfully:', result.events?.length || 0);
+        
+        // Add processing step COMPLETED for successful query
+        if (conversation.threadId) {
+          await threadService.addProcessCompleted(
+            conversation.threadId,
+            'Calendar query completed',
+            {
+              eventCount: result.events?.length || 0,
+              message: result.message,
+              isTimeSlotAvailable: result.isTimeSlotAvailable
+            }
+          );
+        }
+        
         return {
           success: true,
           result: {
@@ -885,6 +1048,19 @@ class ConversationService {
         };
       } else {
         console.log('Failed to query calendar events:', result.error);
+        
+        // Add processing step ERROR for failed query
+        if (conversation.threadId) {
+          await threadService.addProcessError(
+            conversation.threadId,
+            'Calendar query failed',
+            {
+              error: result.error || 'Failed to query calendar events',
+              command: parsedCommand
+            }
+          );
+        }
+        
         return {
           success: false,
           error: result.error || 'Failed to query calendar events',
@@ -896,6 +1072,20 @@ class ConversationService {
       }
     } catch (error) {
       console.error('Error querying calendar events:', error);
+      
+      // Add processing step ERROR for exceptions
+      if (conversation.threadId) {
+        await threadService.addProcessError(
+          conversation.threadId,
+          'Error processing calendar query',
+          {
+            error: error instanceof Error ? error.message : 'Unknown error querying events',
+            intent: intent.primaryIntent,
+            subIntent: intent.subIntent
+          }
+        );
+      }
+      
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Unknown error querying events',
@@ -927,7 +1117,7 @@ class ConversationService {
       if (action.result && action.result.isTimeSlotAvailable === false) {
         const baseMsg = `I'm sorry, I couldn't schedule "${intent.entities.title}" because the time slot is not available.`;
         const suggestionMsg = action.suggestion ? 
-          ` Would ${new Date(action.suggestion).toLocaleString([], {weekday: 'long', hour: '2-digit', minute: '2-digit'})} work instead?` : 
+          ` Would ${new Date(action.suggestion).toLocaleString([], {weekday: 'long', hour: '2-digit', minute:'2-digit'})} work instead?` : 
           '';
         return {
           content: baseMsg + suggestionMsg,
@@ -945,13 +1135,36 @@ class ConversationService {
     // Handle successful actions
     switch (intent.primaryIntent) {
       case 'create':
-        // Extract information for proper time handling
-        const startTime = new Date(intent.entities.startTime);
-        let originalHour = -1;
-        let originalMinute = -1;
-        let displayTime = startTime; // Default to the parsed time
+        // Get user's timezone from context or use system default
+        const userTimezone = intent.entities.context?.timezone || 
+                             Intl.DateTimeFormat().resolvedOptions().timeZone;
         
-        // COMPREHENSIVE TIME VERIFICATION: Extract the original time from user input
+        // Get the time information from the event data directly if available
+        // This is more reliable as it comes from the actually created event
+        let eventTime: Date;
+        if (action.result?.eventData?.start?.dateTime) {
+          // Use the event's actual saved time with timezone
+          const eventTimeString = action.result.eventData.start.dateTime;
+          const eventTimezone = action.result.eventData.start.timeZone || userTimezone;
+          
+          // Format using the actual event data for more accuracy
+          console.log(`Using actual event time from Google Calendar: ${eventTimeString} (${eventTimezone})`);
+          
+          // Create a proper date object that respects the timezone
+          try {
+            // Convert from RFC3339 format (2025-03-28T15:00:00-05:00) to Date
+            eventTime = new Date(eventTimeString);
+          } catch (error) {
+            console.error('Error parsing event time:', error);
+            eventTime = new Date(intent.entities.startTime);
+          }
+        } else {
+          // Fallback to the intent's start time
+          eventTime = new Date(intent.entities.startTime);
+        }
+        
+        // COMPREHENSIVE TIME VERIFICATION: Extract the original time for validation only
+        let requestedTimeString = '';
         if (intent.originalText) {
           // Extract time expressions from the original text using regex
           const timeRegex = /(\d{1,2})(?::(\d{1,2}))?\s*(am|pm)/i;
@@ -962,46 +1175,23 @@ class ConversationService {
             let hour = parseInt(hourStr);
             let minute = minuteStr ? parseInt(minuteStr) : 0;
             
-            // Store the original values for logging
-            originalHour = hour;
-            originalMinute = minute;
+            // Store original time with AM/PM for logging and display
+            requestedTimeString = `${hour}:${minute} ${ampm}`;
             
-            // Apply AM/PM logic to get 24-hour format
-            if (ampm.toLowerCase() === 'pm' && hour < 12) {
-              hour += 12;
-            } else if (ampm.toLowerCase() === 'am' && hour === 12) {
-              hour = 0;
-            }
-            
-            // Check the current time
-            const displayHour = startTime.getHours();
-            const displayMinute = startTime.getMinutes();
-            
-            // Log complete time information for debugging
+            // Log time verification but don't modify the date
             console.log('TIME VERIFICATION:', {
-              requestedTime: `${originalHour}:${originalMinute} ${ampm}`,
-              convertedRequestedTime: `${hour}:${minute}`,
-              systemTime: `${displayHour}:${displayMinute}`,
-              difference: Math.abs(displayHour - hour),
-              originalText: intent.originalText
+              requestedTime: requestedTimeString,
+              eventTime: eventTime.toLocaleString(),
+              originalText: intent.originalText,
+              timezone: userTimezone
             });
-            
-            // Verify times match - fix if there's a significant difference
-            if (Math.abs(displayHour - hour) > 0 || Math.abs(displayMinute - minute) > 5) {
-              console.log(`TIME MISMATCH: Requested ${hour}:${minute} but system shows ${displayHour}:${displayMinute}`);
-              
-              // Create a corrected time with the exact hour/minute requested by user
-              displayTime = new Date(startTime); // Keep the date part
-              displayTime.setHours(hour, minute, 0, 0); // Set to explicitly requested time
-              
-              console.log(`CORRECTION APPLIED: Fixed time to ${displayTime.toLocaleTimeString()}`);
-            }
           }
         }
         
-        // Use the verified time for the response
+        // Use the event time from the calendar for the response
+        // This avoids any date correction issues since we're using the actual event time
         return {
-          content: `Great! I've scheduled "${intent.entities.title}" for ${formatDateTime(displayTime)}.`,
+          content: `Great! I've scheduled "${intent.entities.title}" for ${formatDateTime(eventTime, userTimezone)}.`,
           intent: intent
         };
       case 'update':
@@ -1015,6 +1205,10 @@ class ConversationService {
           intent: intent
         };
       case 'query':
+        // Get user's timezone from context or use system default
+        const queryTimezone = intent.entities.context?.timezone || 
+                             Intl.DateTimeFormat().resolvedOptions().timeZone;
+        
         if (action.result.events.length === 0) {
           if (action.result.isTimeSlotAvailable === true) {
             return {
@@ -1028,9 +1222,14 @@ class ConversationService {
           };
         }
         
-        // Format events list
+        // Format events list using our improved date formatter
         const eventsList = action.result.events
-          .map((e: any) => `- ${e.title} at ${new Date(e.startTime).toLocaleString([], {hour: '2-digit', minute: '2-digit'})}`)
+          .map((e: any) => {
+            // Create proper date object that respects timezone
+            const eventTime = new Date(e.startTime);
+            // Use the improved formatDateTime function
+            return `- ${e.title} at ${formatDateTime(eventTime, queryTimezone).split(' on ')[0]}`;
+          })
           .join('\n');
         
         return {
